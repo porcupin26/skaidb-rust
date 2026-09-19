@@ -10,18 +10,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: build + clippy + test
+  pinned:
+    # The gate: the toolchain rust-toolchain.toml pins (the one the skaidb
+    # monorepo gates with), clippy with warnings denied, every test.
+    name: pinned toolchain — build + clippy + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Installs the toolchain rust-toolchain.toml names, with its components.
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
       # The `kerberos` feature links MIT krb5 through cross-krb5.
       - name: Kerberos headers
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libkrb5-dev
+      - name: Toolchain
+        run: rustc --version && cargo clippy --version
       - name: Build (default features)
         run: cargo build --workspace --locked
       - name: Build (all features)
@@ -32,3 +35,30 @@ jobs:
         run: cargo test --workspace --all-features --locked
       - name: Examples
         run: cargo build --examples --locked
+
+  stable:
+    # Current stable: the crate must keep building and passing its tests
+    # there, since that is what a git-dependency user has. Clippy is
+    # advisory here — a new stable adds lints, and lint drift is not a
+    # driver regression.
+    name: current stable — build + test
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Kerberos headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libkrb5-dev
+      - name: Toolchain
+        run: rustc --version
+      - name: Build (all features)
+        run: cargo build --workspace --all-features --locked
+      - name: Test
+        run: cargo test --workspace --all-features --locked
+      - name: Clippy (advisory)
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        continue-on-error: true
