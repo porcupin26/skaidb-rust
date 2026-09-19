@@ -1,13 +1,8 @@
-//! How to use skaidb from Rust — the native, in-tree driver.
+//! How to use skaidb from Rust — the native driver.
 //!
-//!   cargo run --bin basic_usage -- [host:port] [user] [password]
-//!
-//! Uses `skaidb-driver` as a cargo example of the crate:
 //!   cargo run --example basic_usage -- [host:port] [user] [password]
 
-use skaidb::Client;
-use skaidb::Response;
-use skaidb::Value;
+use skaidb::{Client, Response, Value};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

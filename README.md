@@ -3,7 +3,7 @@
 > monorepo from the `crates/skaidb-driver` crate and the internal crates it
 > depends on, and every sync overwrites it. Changes go to skaidb; issues are
 > welcome on this tracker. Tags (`vX.Y.Z`) are skaidb release versions —
-> this tree is skaidb **0.290.4**.
+> this tree is skaidb **0.291.0**.
 
 # skaidb Rust driver
 
@@ -30,7 +30,7 @@ skaidb version (the mirror's README always shows its own):
 
 ```toml
 [dependencies]
-skaidb = { git = "https://github.com/porcupin26/skaidb-rust", tag = "v0.290.4" }
+skaidb = { git = "https://github.com/porcupin26/skaidb-rust", tag = "v0.291.0" }
 ```
 
 Kerberos (GSSAPI) logins are behind the `kerberos` feature, which links the
@@ -39,7 +39,7 @@ MIT krb5 library through `cross-krb5`. Install the development headers first
 macOS and Windows) and enable the feature:
 
 ```toml
-skaidb = { git = "https://github.com/porcupin26/skaidb-rust", tag = "v0.290.4", features = ["kerberos"] }
+skaidb = { git = "https://github.com/porcupin26/skaidb-rust", tag = "v0.291.0", features = ["kerberos"] }
 ```
 
 The feature is off by default and never builds on static musl targets.
