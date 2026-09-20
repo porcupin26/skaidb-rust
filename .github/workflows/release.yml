@@ -109,12 +109,12 @@ jobs:
           awk -v tag="$TAG" '
             /^## / { if (found) exit; found = ($2 == tag); next }
             found { print }
-          ' CHANGELOG.md | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' > notes-body.md
-          if [ ! -s notes-body.md ]; then
-            echo "Mirror of skaidb $VERSION." > notes-body.md
+          ' CHANGELOG.md | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' > "$RUNNER_TEMP"/notes-body.md
+          if [ ! -s "$RUNNER_TEMP"/notes-body.md ]; then
+            echo "Mirror of skaidb $VERSION." > "$RUNNER_TEMP"/notes-body.md
           fi
           {
-            cat notes-body.md
+            cat "$RUNNER_TEMP"/notes-body.md
             echo
             echo '## Install'
             echo
@@ -124,8 +124,8 @@ jobs:
             echo '```'
             echo
             echo 'The attached `.crate` files are the archives `cargo package --workspace` produced from this tag (what a crates.io publish uploads).'
-          } > release-notes.md
-          cat release-notes.md
+          } > "$RUNNER_TEMP"/release-notes.md
+          cat "$RUNNER_TEMP"/release-notes.md
 
       - name: GitHub Release
         env:
@@ -135,10 +135,10 @@ jobs:
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "release $TAG exists — replacing its assets and notes"
             gh release upload "$TAG" target/package/*.crate --repo "$GITHUB_REPOSITORY" --clobber
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file release-notes.md
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file "$RUNNER_TEMP"/release-notes.md
           else
             gh release create "$TAG" target/package/*.crate --repo "$GITHUB_REPOSITORY" \
-              --verify-tag --title "$TAG" --notes-file release-notes.md
+              --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP"/release-notes.md
           fi
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url,assets \
             --jq '"released " + .url + " with " + (.assets | length | tostring) + " assets"'
@@ -189,11 +189,11 @@ jobs:
               *) echo "::error::crates.io API answered HTTP $code for $crate/$VERSION"; exit 1 ;;
             esac
             for attempt in 1 2 3; do
-              if cargo publish -p "$crate" --no-verify 2>&1 | tee publish.log; then
+              if cargo publish -p "$crate" --no-verify 2>&1 | tee "$RUNNER_TEMP"/publish.log; then
                 published="$published $crate"
                 break
               fi
-              if [ "$attempt" -lt 3 ] && grep -q '429' publish.log; then
+              if [ "$attempt" -lt 3 ] && grep -q '429' "$RUNNER_TEMP"/publish.log; then
                 echo "::warning::crates.io rate limit while publishing $crate — waiting 10 minutes before attempt $((attempt + 1))"
                 sleep 620
               else
@@ -210,7 +210,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           if [ -n "$published" ]; then
             {
-              cat release-notes.md
+              cat "$RUNNER_TEMP"/release-notes.md
               echo
               echo 'On crates.io:'
               echo
@@ -218,7 +218,7 @@ jobs:
               echo '[dependencies]'
               echo "skaidb = \"$VERSION\""
               echo '```'
-            } > release-notes-published.md
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file release-notes-published.md
+            } > "$RUNNER_TEMP"/release-notes-published.md
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$RUNNER_TEMP"/release-notes-published.md
           fi
           echo "crates.io: published [$published ] skipped [$skipped ]"
