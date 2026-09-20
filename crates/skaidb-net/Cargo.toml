@@ -2,7 +2,7 @@
 name = "skaidb-net"
 description = "Shared TLS and plaintext transport plumbing for skaidb: certificate loading, rustls configuration and framed streams"
 readme = "README.md"
-version = "0.294.1"
+version = "0.294.2"
 edition = "2021"
 license = "SSPL-1.0"
 repository = "https://github.com/porcupin26/skaidb-rust"

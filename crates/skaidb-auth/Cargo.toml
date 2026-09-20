@@ -2,7 +2,7 @@
 name = "skaidb-auth"
 description = "Authentication primitives for skaidb: SCRAM-SHA-256 exchange, SHA-256/HMAC/PBKDF2 and credential handling shared by the server and its drivers"
 readme = "README.md"
-version = "0.294.1"
+version = "0.294.2"
 edition = "2021"
 license = "SSPL-1.0"
 repository = "https://github.com/porcupin26/skaidb-rust"

@@ -1,0 +1,36 @@
+[package]
+name = "skaidb-ffi"
+version = "0.294.2"
+edition = "2021"
+license = "SSPL-1.0"
+repository = "https://github.com/porcupin26/skaidb-rust"
+rust-version = "1.93"
+description = "libskaidb: the C ABI over the reference Rust driver (C and C++ clients build against include/skaidb.h and include/skaidb.hpp)"
+publish = false
+
+[lib]
+name = "skaidb"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# The workspace denies `unsafe_code`; an FFI boundary is nothing but raw
+# pointers, so this crate is the reviewed exception (the other is the jemalloc
+# purge hook in skaidb-server). Every dereference is behind the null / UTF-8
+# checks the header promises, and nothing else in the workspace links this
+# crate.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[features]
+default = []
+# Kerberos (SASL GSSAPI) auth for `skaidb_connect_gssapi`; without it the call
+# returns SKAIDB_ERR_UNSUPPORTED.
+kerberos = ["skaidb/kerberos"]
+
+[dependencies]
+skaidb = { path = "../..", version = "0.294.2" }
+skaidb-types = { path = "../skaidb-types", version = "0.294.2" }
+skaidb-proto = { path = "../skaidb-proto", version = "0.294.2" }
+serde_json.workspace = true

@@ -98,7 +98,7 @@ jobs:
       - name: Package every crate
         run: |
           set -euo pipefail
-          cargo package --workspace --locked
+          cargo package --workspace --exclude skaidb-ffi --locked
           ls -l target/package/*.crate
 
       - name: Release notes from CHANGELOG.md
