@@ -1,6 +1,7 @@
 [package]
 name = "skaidb-auth"
-version = "0.291.0"
+description = "Authentication primitives for skaidb: SCRAM-SHA-256 exchange, SHA-256/HMAC/PBKDF2 and credential handling shared by the server and its drivers"
+version = "0.294.0"
 edition = "2021"
 license = "SSPL-1.0"
 repository = "https://github.com/porcupin26/skaidb-rust"

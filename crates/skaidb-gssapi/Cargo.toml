@@ -1,6 +1,7 @@
 [package]
 name = "skaidb-gssapi"
-version = "0.291.0"
+description = "Kerberos (SASL GSSAPI) security-context helpers for skaidb client authentication, a thin safe wrapper over cross-krb5"
+version = "0.294.0"
 edition = "2021"
 license = "SSPL-1.0"
 repository = "https://github.com/porcupin26/skaidb-rust"

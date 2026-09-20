@@ -337,9 +337,21 @@ impl Client {
     /// # Ok::<(), skaidb::DriverError>(())
     /// ```
     pub fn with_database(mut self, database: &str) -> Result<Client, DriverError> {
-        self.database = Some(database.to_string());
-        self.apply_database()?;
+        self.use_database(database)?;
         Ok(self)
+    }
+
+    /// Bind (or rebind) the session database on a live client: `USE` now,
+    /// and again after every failover. A refusal (unknown database, no
+    /// privilege) leaves the previous binding and the connection as they
+    /// were.
+    pub fn use_database(&mut self, database: &str) -> Result<(), DriverError> {
+        let previous = self.database.replace(database.to_string());
+        if let Err(e) = self.apply_database() {
+            self.database = previous;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// The session database, if one was bound.
