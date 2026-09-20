@@ -1,7 +1,8 @@
 [package]
 name = "skaidb-types"
 description = "Core value and document model of skaidb — the schema-less row representation, key encoding and type rules shared by the server and its drivers"
-version = "0.294.0"
+readme = "README.md"
+version = "0.294.1"
 edition = "2021"
 license = "SSPL-1.0"
 repository = "https://github.com/porcupin26/skaidb-rust"

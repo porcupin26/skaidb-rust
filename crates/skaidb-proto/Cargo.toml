@@ -1,7 +1,8 @@
 [package]
 name = "skaidb-proto"
 description = "skaidb's binary wire protocol (SCP): request and response frames, value encoding and consistency levels shared by the server and its drivers"
-version = "0.294.0"
+readme = "README.md"
+version = "0.294.1"
 edition = "2021"
 license = "SSPL-1.0"
 repository = "https://github.com/porcupin26/skaidb-rust"
@@ -11,5 +12,5 @@ rust-version = "1.93"
 workspace = true
 
 [dependencies]
-skaidb-types = { path = "../skaidb-types", version = "0.294.0" }
+skaidb-types = { path = "../skaidb-types", version = "0.294.1" }
 thiserror.workspace = true

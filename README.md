@@ -1,10 +1,3 @@
-> **Generated mirror — do not send pull requests here.** This repository is
-> produced by `scripts/sync-rust-driver.sh` in the [skaidb](https://github.com/porcupin26/skaidb)
-> monorepo from the `crates/skaidb-driver` crate and the internal crates it
-> depends on, and every sync overwrites it. Changes go to skaidb; issues are
-> welcome on this tracker. Tags (`vX.Y.Z`) are skaidb release versions —
-> this tree is skaidb **0.294.0**.
-
 # skaidb Rust driver
 
 The native, synchronous Rust client for [skaidb](https://skaidb.org). It
@@ -18,19 +11,19 @@ official driver follows.
 - Wire protocol specification: <https://skaidb.org/docs/PROTOCOL.html>
 - skaidb documentation (SQL, types, clustering, security):
   <https://skaidb.org/docs/>
-- Source of truth: the `crates/skaidb-driver` crate in the skaidb monorepo.
-  The public repository <https://github.com/porcupin26/skaidb-rust> is a
-  generated mirror of that crate and the internal crates it needs, tagged
-  with the skaidb version it was cut from.
+- Source: <https://github.com/porcupin26/skaidb-rust> (the crate with the
+  internal crates it depends on, tagged with the skaidb version); the same
+  code lives in `crates/skaidb-driver` of the
+  [skaidb](https://github.com/porcupin26/skaidb) repository.
 
 ## Install
 
-The crate is consumed as a git dependency from the mirror; the tag is the
-skaidb version (the mirror's README always shows its own):
+The crate is on crates.io; its version is the skaidb release it ships and
+is tested with:
 
 ```toml
 [dependencies]
-skaidb = { git = "https://github.com/porcupin26/skaidb-rust", tag = "v0.294.0" }
+skaidb = "0.294"
 ```
 
 Kerberos (GSSAPI) logins are behind the `kerberos` feature, which links the
@@ -39,7 +32,7 @@ MIT krb5 library through `cross-krb5`. Install the development headers first
 macOS and Windows) and enable the feature:
 
 ```toml
-skaidb = { git = "https://github.com/porcupin26/skaidb-rust", tag = "v0.294.0", features = ["kerberos"] }
+skaidb = { version = "0.294", features = ["kerberos"] }
 ```
 
 The feature is off by default and never builds on static musl targets.
@@ -543,10 +536,10 @@ release:
 | `Hello` self-identification | ≥ 0.203.0 (ignored otherwise) |
 | `Value` re-exports (`skaidb::{Value, Consistency, Response, ProtoError}`) | driver ≥ 0.290.4; older versions need `skaidb-types` / `skaidb-proto` as direct dependencies |
 
-The mirror repository is tagged with the skaidb version it was generated
-from; the driver from tag `vX.Y.Z` is the one shipped and tested with
-server `X.Y.Z`, and the protocol is backward compatible, so a newer driver
-talks to an older server (minus the gated calls above) and vice versa.
+The driver's version is the skaidb version: driver `X.Y.Z` is the one
+shipped and tested with server `X.Y.Z`, and the protocol is backward
+compatible, so a newer driver talks to an older server (minus the gated
+calls above) and vice versa.
 
 ## Examples
 
