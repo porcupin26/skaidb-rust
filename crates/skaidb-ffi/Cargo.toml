@@ -11,6 +11,10 @@ publish = false
 [lib]
 name = "skaidb"
 crate-type = ["staticlib", "cdylib", "rlib"]
+# No doctests: an FFI surface documents itself in the header, and in the
+# public mirror the driver crate is also named `skaidb`, which makes the
+# doctest harness ambiguous about which rlib it links (E0464).
+doctest = false
 
 # The workspace denies `unsafe_code`; an FFI boundary is nothing but raw
 # pointers, so this crate is the reviewed exception (the other is the jemalloc
