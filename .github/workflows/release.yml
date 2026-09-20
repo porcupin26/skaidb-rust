@@ -1,0 +1,222 @@
+# Release: a pushed tag vX.Y.Z (the tag the mirror sync cuts, see
+# docs/RELEASING.md in the skaidb monorepo) builds and tests the workspace on
+# the pinned toolchain, packages all six crates, creates the GitHub Release
+# with that version's CHANGELOG entry and the .crate files attached, and
+# publishes the crates to crates.io in dependency order.
+#
+# The crates.io publish runs only when the CARGO_REGISTRY_TOKEN secret is set
+# on this repository; without it the step is skipped with a notice and the run
+# still succeeds, so a tag always gets its GitHub Release. Crate versions that
+# are already on crates.io are skipped, so a failed run can be re-run safely.
+#
+# workflow_dispatch runs the same job for an existing tag (input `tag`): how
+# a tag pushed before this workflow existed, or before the token was added,
+# gets its release and its crates.io publish.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release, e.g. v0.291.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: build + test + package + GitHub Release + crates.io
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      # Installs the toolchain rust-toolchain.toml names, with its components.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The `kerberos` feature links MIT krb5 through cross-krb5.
+      - name: Kerberos headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libkrb5-dev
+      - name: Toolchain
+        run: rustc --version && cargo --version
+
+      - name: Tag matches the crate versions
+        id: version
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::tag '$TAG' is not of the form vX.Y.Z"; exit 1 ;;
+          esac
+          version="${TAG#v}"
+          git rev-parse -q --verify "refs/tags/$TAG^{commit}" >/dev/null \
+            || git fetch --depth=1 origin "+refs/tags/$TAG:refs/tags/$TAG"
+          tagged="$(git rev-parse --verify "refs/tags/$TAG^{commit}")"
+          head="$(git rev-parse HEAD)"
+          if [ "$tagged" != "$head" ]; then
+            echo "::error::checked out $head but tag $TAG points at $tagged"; exit 1
+          fi
+          meta="$(cargo metadata --no-deps --format-version 1 --locked)"
+          root="$(jq -r '.packages[] | select(.name == "skaidb") | .version' <<<"$meta")"
+          if [ "$root" != "$version" ]; then
+            echo "::error::tag is $TAG but [package] version in Cargo.toml is $root"; exit 1
+          fi
+          off="$(jq -r --arg v "$version" '.packages[] | select(.version != $v) | "\(.name)@\(.version)"' <<<"$meta")"
+          if [ -n "$off" ]; then
+            echo "::error::workspace crates not at $version: $off"; exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "$TAG = skaidb $version at $tagged"
+
+      - name: Build (all features)
+        run: cargo build --workspace --all-features --locked
+      - name: Test
+        run: cargo test --workspace --all-features --locked
+
+      # Packages every crate in dependency order and verifies each one builds
+      # from its .crate with the path dependencies rewritten to registry
+      # dependencies (the sibling crates come from the local overlay) — the
+      # exact archives a crates.io publish uploads.
+      - name: Package every crate
+        run: |
+          set -euo pipefail
+          cargo package --workspace --locked
+          ls -l target/package/*.crate
+
+      - name: Release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          awk -v tag="$TAG" '
+            /^## / { if (found) exit; found = ($2 == tag); next }
+            found { print }
+          ' CHANGELOG.md | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' > notes-body.md
+          if [ ! -s notes-body.md ]; then
+            echo "Mirror of skaidb $VERSION." > notes-body.md
+          fi
+          {
+            cat notes-body.md
+            echo
+            echo '## Install'
+            echo
+            echo '```toml'
+            echo '[dependencies]'
+            echo "skaidb = { git = \"https://github.com/${GITHUB_REPOSITORY}\", tag = \"$TAG\" }"
+            echo '```'
+            echo
+            echo 'The attached `.crate` files are the archives `cargo package --workspace` produced from this tag (what a crates.io publish uploads).'
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG exists — replacing its assets and notes"
+            gh release upload "$TAG" target/package/*.crate --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file release-notes.md
+          else
+            gh release create "$TAG" target/package/*.crate --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --title "$TAG" --notes-file release-notes.md
+          fi
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url,assets \
+            --jq '"released " + .url + " with " + (.assets | length | tostring) + " assets"'
+
+      - name: crates.io credential
+        id: token
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "CARGO_REGISTRY_TOKEN is set — publishing to crates.io"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            msg="CARGO_REGISTRY_TOKEN is not set on this repository: the GitHub Release was created but nothing was published to crates.io. Add a crates.io API token (publish-new + publish-update scopes) as the CARGO_REGISTRY_TOKEN secret, then re-run this workflow for $TAG (Actions → Release → Run workflow)."
+            echo "::notice title=crates.io publish skipped::$msg"
+            printf '## crates.io publish skipped\n\n%s\n' "$msg" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Dependency order, one `cargo publish` per crate: cargo waits for each
+      # crate to appear in the index before returning, so the next one's
+      # rewritten registry dependency resolves. Versions already on crates.io
+      # are skipped (a re-run after a partial failure publishes the rest).
+      # Verification is skipped here because the package step above already
+      # built every crate from its .crate. crates.io rate-limits NEW crate
+      # names (a burst, then one per 10 minutes); a 429 waits and retries.
+      - name: Publish to crates.io
+        if: steps.token.outputs.present == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          order="skaidb-types skaidb-proto skaidb-auth skaidb-net skaidb-gssapi skaidb"
+          ua="skaidb-rust release workflow (https://github.com/${GITHUB_REPOSITORY})"
+          published=""
+          skipped=""
+          for crate in $order; do
+            code="$(curl -s -A "$ua" -o /dev/null -w '%{http_code}' "https://crates.io/api/v1/crates/$crate/$VERSION" || true)"
+            case "$code" in
+              200)
+                echo "$crate $VERSION is already on crates.io — skipping"
+                skipped="$skipped $crate"
+                continue ;;
+              404) ;;
+              *) echo "::error::crates.io API answered HTTP $code for $crate/$VERSION"; exit 1 ;;
+            esac
+            for attempt in 1 2 3; do
+              if cargo publish -p "$crate" --no-verify 2>&1 | tee publish.log; then
+                published="$published $crate"
+                break
+              fi
+              if [ "$attempt" -lt 3 ] && grep -q '429' publish.log; then
+                echo "::warning::crates.io rate limit while publishing $crate — waiting 10 minutes before attempt $((attempt + 1))"
+                sleep 620
+              else
+                echo "::error::publishing $crate $VERSION to crates.io failed"
+                exit 1
+              fi
+            done
+          done
+          {
+            echo "## crates.io"
+            echo
+            [ -z "$published" ] || echo "Published $VERSION:$published"
+            [ -z "$skipped" ] || echo "Already present, skipped:$skipped"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$published" ]; then
+            {
+              cat release-notes.md
+              echo
+              echo 'On crates.io:'
+              echo
+              echo '```toml'
+              echo '[dependencies]'
+              echo "skaidb = \"$VERSION\""
+              echo '```'
+            } > release-notes-published.md
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file release-notes-published.md
+          fi
+          echo "crates.io: published [$published ] skipped [$skipped ]"
