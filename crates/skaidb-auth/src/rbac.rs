@@ -22,6 +22,11 @@ pub enum Privilege {
     /// lets an application role report cluster health and its effective
     /// config without an admin credential. Never authorizes a mutation.
     Monitor,
+    /// See the advisor's findings: on a database, that database's own
+    /// advice; on `*`, every category (host and suspected-bug findings
+    /// included). Any privilege on a database already shows its advice;
+    /// this one grants the view without granting the data.
+    Advisor,
     /// MQTT: publish to topics matching a granted filter.
     Publish,
     /// MQTT: subscribe with filters covered by a granted filter.
@@ -90,6 +95,7 @@ pub fn privilege_name(p: Privilege) -> &'static str {
         Privilege::Drop => "drop",
         Privilege::Grant => "grant",
         Privilege::Monitor => "monitor",
+        Privilege::Advisor => "advisor",
         Privilege::Publish => "publish",
         Privilege::Subscribe => "subscribe",
         Privilege::Execute => "execute",
@@ -109,6 +115,7 @@ pub fn privilege_from_name(s: &str) -> Option<Privilege> {
         "drop" => Privilege::Drop,
         "grant" => Privilege::Grant,
         "monitor" => Privilege::Monitor,
+        "advisor" => Privilege::Advisor,
         "publish" => Privilege::Publish,
         "subscribe" => Privilege::Subscribe,
         "execute" => Privilege::Execute,

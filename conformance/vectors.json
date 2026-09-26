@@ -1,0 +1,1230 @@
+{
+  "auth": {
+    "challenge": {
+      "example_payload": "0b10000000031425364758697a8b9cadbecfe0f1020010000012000000434c49454e544e4f4e43457372762d58595a",
+      "iterations": 4096,
+      "salt": "031425364758697a8b9cadbecfe0f102",
+      "server_nonce_suffix": "srv-XYZ"
+    },
+    "outcomes": [
+      {
+        "about": "Correct server signature: the connect succeeds.",
+        "expect": "connected",
+        "name": "ok",
+        "server_signature": "correct"
+      },
+      {
+        "about": "A signature that does not verify must fail the connect (mutual authentication).",
+        "expect": "auth_error",
+        "name": "bad_server_signature",
+        "server_signature": "wrong"
+      },
+      {
+        "about": "AuthOutcome Denied: the connect fails with the reason.",
+        "expect": "auth_error",
+        "name": "denied",
+        "payload": "0d0013000000696e76616c69642063726564656e7469616c73",
+        "reason": "invalid credentials"
+      }
+    ],
+    "password": "p@ss w0rd ✓",
+    "username": "conform"
+  },
+  "cases": [
+    {
+      "about": "One row carrying every value vector; the driver surfaces each exactly.",
+      "call": {
+        "consistency": "quorum",
+        "method": "query",
+        "sql": "SELECT every_type"
+      },
+      "exchanges": [
+        {
+          "request": "01011100000053454c4543542065766572795f74797065",
+          "responses": [
+            "0021000000040000006e756c6c09000000626f6f6c5f747275650a000000626f6f6c5f66616c736508000000696e745f7a65726f07000000696e745f6f6e650d000000696e745f6d696e75735f6f6e6507000000696e745f6d617807000000696e745f6d696e0f000000696e745f6265796f6e645f325f35330a000000666c6f61745f7a65726f13000000666c6f61745f6e656761746976655f7a65726f12000000666c6f61745f6f6e655f616e645f68616c6614000000666c6f61745f6c617267655f6e656761746976650a000000666c6f61745f74696e790b000000666c6f61745f74686972640d000000646563696d616c5f63656e747310000000646563696d616c5f6e656761746976650c000000646563696d616c5f776964650c000000737472696e675f656d7074790c000000737472696e675f61736369690e000000737472696e675f756e69636f64650c000000737472696e675f71756f74650b00000062797465735f656d7074790c00000062797465735f62696e61727904000000757569640f00000074696d657374616d705f65706f63681000000074696d657374616d705f726563656e741200000074696d657374616d705f6e656761746976650b00000061727261795f656d7074790b00000061727261795f6d697865640c00000061727261795f6e65737465640e000000646f63756d656e745f656d7074790f000000646f63756d656e745f6e65737465640100000021000000010000000002000000010102000000010009000000020000000000000000090000000201000000000000000900000002ffffffffffffffff0900000002ffffffffffffff7f090000000200000000000000800900000002010000000000200009000000030000000000000000090000000300000000000000800900000003000000000000f83f0900000003000000046bf414c2090000000359f3f8c21f6ea5010900000003555555555555d53f150000000439300000000000000000000000000000020000001500000004ffffffffffffffffffffffffffffffff00000000150000000407000040eaed7446d09c2c9f0c0000000a0000000500000005000000000a000000050500000068656c6c6f150000000510000000c3bc6ec3af63c3b664c3a920f09f988012000000050d00000069742773202271756f746564220500000006000000000a000000060500000000017f80ff1100000007123e4567e89b12d3a4564266141740000900000008000000000000000009000000087b68e5cf8b010000090000000818fcffffffffffff05000000090000000015000000090300000002010000000000000005010000006100110000000902000000090100000001010900000000050000000a00000000410000000a03000000010000006102010000000000000001000000620902000000010103000000000000044001000000630a0100000005000000696e6e6572050100000078"
+          ]
+        }
+      ],
+      "expect": {
+        "rows": {
+          "columns": [
+            "null",
+            "bool_true",
+            "bool_false",
+            "int_zero",
+            "int_one",
+            "int_minus_one",
+            "int_max",
+            "int_min",
+            "int_beyond_2_53",
+            "float_zero",
+            "float_negative_zero",
+            "float_one_and_half",
+            "float_large_negative",
+            "float_tiny",
+            "float_third",
+            "decimal_cents",
+            "decimal_negative",
+            "decimal_wide",
+            "string_empty",
+            "string_ascii",
+            "string_unicode",
+            "string_quote",
+            "bytes_empty",
+            "bytes_binary",
+            "uuid",
+            "timestamp_epoch",
+            "timestamp_recent",
+            "timestamp_negative",
+            "array_empty",
+            "array_mixed",
+            "array_nested",
+            "document_empty",
+            "document_nested"
+          ],
+          "rows": [
+            [
+              {
+                "null": true
+              },
+              {
+                "bool": true
+              },
+              {
+                "bool": false
+              },
+              {
+                "int": "0"
+              },
+              {
+                "int": "1"
+              },
+              {
+                "int": "-1"
+              },
+              {
+                "int": "9223372036854775807"
+              },
+              {
+                "int": "-9223372036854775808"
+              },
+              {
+                "int": "9007199254740993"
+              },
+              {
+                "float": 0.0,
+                "float_bits": "0000000000000000"
+              },
+              {
+                "float": -0.0,
+                "float_bits": "8000000000000000"
+              },
+              {
+                "float": 1.5,
+                "float_bits": "3ff8000000000000"
+              },
+              {
+                "float": -22500000000.0,
+                "float_bits": "c214f46b04000000"
+              },
+              {
+                "float": 1e-300,
+                "float_bits": "01a56e1fc2f8f359"
+              },
+              {
+                "float": 0.3333333333333333,
+                "float_bits": "3fd5555555555555"
+              },
+              {
+                "decimal": {
+                  "mantissa": "12345",
+                  "scale": 2
+                }
+              },
+              {
+                "decimal": {
+                  "mantissa": "-1",
+                  "scale": 0
+                }
+              },
+              {
+                "decimal": {
+                  "mantissa": "1000000000000000000000000000007",
+                  "scale": 10
+                }
+              },
+              {
+                "string": ""
+              },
+              {
+                "string": "hello"
+              },
+              {
+                "string": "ünïcödé 😀"
+              },
+              {
+                "string": "it's \"quoted\""
+              },
+              {
+                "bytes": ""
+              },
+              {
+                "bytes": "00017f80ff"
+              },
+              {
+                "uuid": "123e4567-e89b-12d3-a456-426614174000"
+              },
+              {
+                "timestamp_ms": "0"
+              },
+              {
+                "timestamp_ms": "1700000000123"
+              },
+              {
+                "timestamp_ms": "-1000"
+              },
+              {
+                "array": []
+              },
+              {
+                "array": [
+                  {
+                    "int": "1"
+                  },
+                  {
+                    "string": "a"
+                  },
+                  {
+                    "null": true
+                  }
+                ]
+              },
+              {
+                "array": [
+                  {
+                    "array": [
+                      {
+                        "bool": true
+                      }
+                    ]
+                  },
+                  {
+                    "array": []
+                  }
+                ]
+              },
+              {
+                "document": []
+              },
+              {
+                "document": [
+                  {
+                    "key": "a",
+                    "value": {
+                      "int": "1"
+                    }
+                  },
+                  {
+                    "key": "b",
+                    "value": {
+                      "array": [
+                        {
+                          "bool": true
+                        },
+                        {
+                          "float": 2.5,
+                          "float_bits": "4004000000000000"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "key": "c",
+                    "value": {
+                      "document": [
+                        {
+                          "key": "inner",
+                          "value": {
+                            "string": "x"
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      "name": "query_rows_every_value_type"
+    },
+    {
+      "about": "Several rows, a NULL cell among them.",
+      "call": {
+        "consistency": "quorum",
+        "method": "query",
+        "sql": "SELECT id, name FROM t"
+      },
+      "exchanges": [
+        {
+          "request": "01011600000053454c4543542069642c206e616d652046524f4d2074",
+          "responses": [
+            "0002000000020000006964040000006e616d650300000002000000090000000201000000000000000600000005010000006102000000090000000202000000000000000100000000020000000900000002030000000000000006000000050100000063"
+          ]
+        }
+      ],
+      "expect": {
+        "rows": {
+          "columns": [
+            "id",
+            "name"
+          ],
+          "rows": [
+            [
+              {
+                "int": "1"
+              },
+              {
+                "string": "a"
+              }
+            ],
+            [
+              {
+                "int": "2"
+              },
+              {
+                "null": true
+              }
+            ],
+            [
+              {
+                "int": "3"
+              },
+              {
+                "string": "c"
+              }
+            ]
+          ]
+        }
+      },
+      "name": "query_rows_several"
+    },
+    {
+      "about": "Columns but no rows.",
+      "call": {
+        "consistency": "quorum",
+        "method": "query",
+        "sql": "SELECT id FROM t WHERE false"
+      },
+      "exchanges": [
+        {
+          "request": "01011c00000053454c4543542069642046524f4d20742057484552452066616c7365",
+          "responses": [
+            "000100000002000000696400000000"
+          ]
+        }
+      ],
+      "expect": {
+        "rows": {
+          "columns": [
+            "id"
+          ],
+          "rows": []
+        }
+      },
+      "name": "query_rows_empty"
+    },
+    {
+      "about": "The consistency byte is 0 for ONE.",
+      "call": {
+        "consistency": "one",
+        "method": "query",
+        "sql": "SELECT 1"
+      },
+      "exchanges": [
+        {
+          "request": "01000800000053454c4543542031",
+          "responses": [
+            "00010000000100000078010000000100000009000000020100000000000000"
+          ]
+        }
+      ],
+      "expect": {
+        "rows": {
+          "columns": [
+            "x"
+          ],
+          "rows": [
+            [
+              {
+                "int": "1"
+              }
+            ]
+          ]
+        }
+      },
+      "name": "query_consistency_one"
+    },
+    {
+      "about": "The consistency byte is 2 for ALL.",
+      "call": {
+        "consistency": "all",
+        "method": "query",
+        "sql": "SELECT 1"
+      },
+      "exchanges": [
+        {
+          "request": "01020800000053454c4543542031",
+          "responses": [
+            "00010000000100000078010000000100000009000000020100000000000000"
+          ]
+        }
+      ],
+      "expect": {
+        "rows": {
+          "columns": [
+            "x"
+          ],
+          "rows": [
+            [
+              {
+                "int": "1"
+              }
+            ]
+          ]
+        }
+      },
+      "name": "query_consistency_all"
+    },
+    {
+      "about": "SQL text is UTF-8 with a byte-count length.",
+      "call": {
+        "consistency": "quorum",
+        "method": "query",
+        "sql": "INSERT INTO t (s) VALUES ('ünïcödé 😀')"
+      },
+      "exchanges": [
+        {
+          "request": "01012d000000494e5345525420494e544f2074202873292056414c554553202827c3bc6ec3af63c3b664c3a920f09f98802729",
+          "responses": [
+            "010100000000000000"
+          ]
+        }
+      ],
+      "expect": {
+        "affected": "1"
+      },
+      "name": "query_unicode_sql"
+    },
+    {
+      "about": "A DML statement's affected count (u64).",
+      "call": {
+        "consistency": "quorum",
+        "method": "query",
+        "sql": "UPDATE t SET x = 1"
+      },
+      "exchanges": [
+        {
+          "request": "0101120000005550444154452074205345542078203d2031",
+          "responses": [
+            "012a00000000000000"
+          ]
+        }
+      ],
+      "expect": {
+        "affected": "42"
+      },
+      "name": "query_mutation"
+    },
+    {
+      "about": "A DDL statement's bare acknowledgement.",
+      "call": {
+        "consistency": "quorum",
+        "method": "query",
+        "sql": "CREATE TABLE t (PRIMARY KEY (id))"
+      },
+      "exchanges": [
+        {
+          "request": "010121000000435245415445205441424c45207420285052494d415259204b4559202869642929",
+          "responses": [
+            "02"
+          ]
+        }
+      ],
+      "expect": {
+        "ddl": true
+      },
+      "name": "query_ddl"
+    },
+    {
+      "about": "A server error surfaces as the driver's query error, message intact.",
+      "call": {
+        "consistency": "quorum",
+        "method": "query",
+        "sql": "SELECT nope"
+      },
+      "exchanges": [
+        {
+          "request": "01010b00000053454c454354206e6f7065",
+          "responses": [
+            "0314000000756e6b6e6f776e20636f6c756d6e3a206e6f7065"
+          ]
+        }
+      ],
+      "expect": {
+        "error": "unknown column: nope"
+      },
+      "name": "query_error"
+    },
+    {
+      "about": "After an error the connection serves the next statement.",
+      "call": {
+        "calls": [
+          {
+            "consistency": "quorum",
+            "method": "query",
+            "sql": "SELECT nope"
+          },
+          {
+            "consistency": "quorum",
+            "method": "query",
+            "sql": "SELECT 1"
+          }
+        ],
+        "method": "sequence"
+      },
+      "exchanges": [
+        {
+          "request": "01010b00000053454c454354206e6f7065",
+          "responses": [
+            "0304000000626f6f6d"
+          ]
+        },
+        {
+          "request": "01010800000053454c4543542031",
+          "responses": [
+            "00010000000100000078010000000100000009000000020100000000000000"
+          ]
+        }
+      ],
+      "expect": {
+        "sequence": [
+          {
+            "error": "boom"
+          },
+          {
+            "rows": {
+              "columns": [
+                "x"
+              ],
+              "rows": [
+                [
+                  {
+                    "int": "1"
+                  }
+                ]
+              ]
+            }
+          }
+        ]
+      },
+      "name": "query_error_then_reuse"
+    },
+    {
+      "about": "Several result sets in one reply (a CALL that EMITs); the last is the call's own result.",
+      "call": {
+        "consistency": "quorum",
+        "method": "query",
+        "sql": "CALL p()"
+      },
+      "exchanges": [
+        {
+          "request": "01010800000043414c4c20702829",
+          "responses": [
+            "0802000000010000000100000061020000000100000009000000020100000000000000010000000900000002020000000000000002000000010000006201000000630100000002000000060000000501000000780100000000"
+          ]
+        }
+      ],
+      "expect": {
+        "result_sets": [
+          {
+            "columns": [
+              "a"
+            ],
+            "rows": [
+              [
+                {
+                  "int": "1"
+                }
+              ],
+              [
+                {
+                  "int": "2"
+                }
+              ]
+            ]
+          },
+          {
+            "columns": [
+              "b",
+              "c"
+            ],
+            "rows": [
+              [
+                {
+                  "string": "x"
+                },
+                {
+                  "null": true
+                }
+              ]
+            ]
+          }
+        ]
+      },
+      "name": "result_sets"
+    },
+    {
+      "about": "OP_QUERY_STREAM: header, chunks, end; the driver yields every row in order.",
+      "call": {
+        "method": "query_stream",
+        "sql": "SELECT id, name FROM t"
+      },
+      "exchanges": [
+        {
+          "request": "05011600000053454c4543542069642c206e616d652046524f4d2074",
+          "responses": [
+            "0502000000020000006964040000006e616d65",
+            "060200000002000000090000000201000000000000000600000005010000006102000000090000000202000000000000000100000000",
+            "0601000000020000000900000002030000000000000006000000050100000063",
+            "07"
+          ]
+        }
+      ],
+      "expect": {
+        "rows": {
+          "columns": [
+            "id",
+            "name"
+          ],
+          "rows": [
+            [
+              {
+                "int": "1"
+              },
+              {
+                "string": "a"
+              }
+            ],
+            [
+              {
+                "int": "2"
+              },
+              {
+                "null": true
+              }
+            ],
+            [
+              {
+                "int": "3"
+              },
+              {
+                "string": "c"
+              }
+            ]
+          ]
+        }
+      },
+      "name": "stream_rows"
+    },
+    {
+      "about": "A stream may carry no chunk at all, or empty chunks.",
+      "call": {
+        "method": "query_stream",
+        "sql": "SELECT id FROM t WHERE false"
+      },
+      "exchanges": [
+        {
+          "request": "05011c00000053454c4543542069642046524f4d20742057484552452066616c7365",
+          "responses": [
+            "0501000000020000006964",
+            "0600000000",
+            "07"
+          ]
+        }
+      ],
+      "expect": {
+        "rows": {
+          "columns": [
+            "id"
+          ],
+          "rows": []
+        }
+      },
+      "name": "stream_empty_chunks"
+    },
+    {
+      "about": "A streamed statement that produces no rows answers with one ordinary frame.",
+      "call": {
+        "method": "query_stream",
+        "sql": "DELETE FROM t"
+      },
+      "exchanges": [
+        {
+          "request": "05010d00000044454c4554452046524f4d2074",
+          "responses": [
+            "010300000000000000"
+          ]
+        }
+      ],
+      "expect": {
+        "affected": "3"
+      },
+      "name": "stream_non_row_result"
+    },
+    {
+      "about": "An error instead of a header: the statement failed.",
+      "call": {
+        "method": "query_stream",
+        "sql": "SELECT nope"
+      },
+      "exchanges": [
+        {
+          "request": "05010b00000053454c454354206e6f7065",
+          "responses": [
+            "030d0000006e6f2073756368207461626c65"
+          ]
+        }
+      ],
+      "expect": {
+        "error": "no such table"
+      },
+      "name": "stream_error_before_header"
+    },
+    {
+      "about": "An error mid-stream: the rows delivered before it are valid, then the error surfaces.",
+      "call": {
+        "method": "query_stream",
+        "sql": "SELECT id, name FROM t"
+      },
+      "exchanges": [
+        {
+          "request": "05011600000053454c4543542069642c206e616d652046524f4d2074",
+          "responses": [
+            "0502000000020000006964040000006e616d65",
+            "060200000002000000090000000201000000000000000600000005010000006102000000090000000202000000000000000100000000",
+            "03140000007363616e20627564676574206578636565646564"
+          ]
+        }
+      ],
+      "expect": {
+        "rows_then_error": {
+          "error": "scan budget exceeded",
+          "rows": {
+            "columns": [
+              "id",
+              "name"
+            ],
+            "rows": [
+              [
+                {
+                  "int": "1"
+                },
+                {
+                  "string": "a"
+                }
+              ],
+              [
+                {
+                  "int": "2"
+                },
+                {
+                  "null": true
+                }
+              ]
+            ]
+          }
+        }
+      },
+      "name": "stream_error_after_header"
+    },
+    {
+      "about": "OP_PREPARE then OP_EXECUTE with typed parameters in `?` order.",
+      "call": {
+        "consistency": "quorum",
+        "method": "execute_prepared",
+        "params": [
+          {
+            "int": "7"
+          },
+          {
+            "string": "o'neil"
+          },
+          {
+            "float": 2.5,
+            "float_bits": "4004000000000000"
+          },
+          {
+            "bool": true
+          },
+          {
+            "null": true
+          },
+          {
+            "bytes": "dead"
+          }
+        ],
+        "sql": "SELECT * FROM t WHERE a = ? AND b = ? AND c = ? AND d = ? AND e = ? AND f = ?"
+      },
+      "exchanges": [
+        {
+          "request": "024d00000053454c454354202a2046524f4d20742057484552452061203d203f20414e442062203d203f20414e442063203d203f20414e442064203d203f20414e442065203d203f20414e442066203d203f",
+          "responses": [
+            "04090000000600"
+          ]
+        },
+        {
+          "request": "0301090000000600090000000207000000000000000b00000005060000006f276e65696c090000000300000000000004400200000001010100000000070000000602000000dead",
+          "responses": [
+            "0001000000020000006f6b0100000001000000020000000101"
+          ]
+        }
+      ],
+      "expect": {
+        "rows": {
+          "columns": [
+            "ok"
+          ],
+          "rows": [
+            [
+              {
+                "bool": true
+              }
+            ]
+          ]
+        }
+      },
+      "name": "prepare_execute"
+    },
+    {
+      "about": "OP_PREPARE then OP_EXECUTE_BATCH: every parameter row in one request; the reply is the total affected count.",
+      "call": {
+        "consistency": "quorum",
+        "method": "execute_batch",
+        "rows": [
+          [
+            {
+              "int": "1"
+            },
+            {
+              "string": "x"
+            }
+          ],
+          [
+            {
+              "int": "2"
+            },
+            {
+              "string": "y"
+            }
+          ],
+          [
+            {
+              "int": "3"
+            },
+            {
+              "null": true
+            }
+          ]
+        ],
+        "sql": "INSERT INTO t (id, name) VALUES (?, ?)"
+      },
+      "exchanges": [
+        {
+          "request": "0226000000494e5345525420494e544f2074202869642c206e616d65292056414c55455320283f2c203f29",
+          "responses": [
+            "04030000000200"
+          ]
+        },
+        {
+          "request": "0701030000000300000002000900000002010000000000000006000000050100000078020009000000020200000000000000060000000501000000790200090000000203000000000000000100000000",
+          "responses": [
+            "010300000000000000"
+          ]
+        }
+      ],
+      "expect": {
+        "affected": "3"
+      },
+      "name": "execute_batch"
+    }
+  ],
+  "consistency": [
+    {
+      "byte": 0,
+      "name": "one"
+    },
+    {
+      "byte": 1,
+      "name": "quorum"
+    },
+    {
+      "byte": 2,
+      "name": "all"
+    }
+  ],
+  "format_version": 1,
+  "generator": "skaidb-conformance (cargo run -p skaidb-conformance -- --write)",
+  "ignorable_requests": {
+    "about": "Requests a driver may send at its own discretion between or around cases; the fake server answers them and does not count them against a case.",
+    "ddl_payload": "02",
+    "opcodes": {
+      "4": "OP_CLOSE (answer Ddl)",
+      "8": "OP_HELLO (answer Ddl)"
+    }
+  },
+  "scram": [
+    {
+      "auth_message": "636f6e666f726d0063313233342e300063313233342e307372762d58595a0030333134323533363437353836393761386239636164626563666530663130320034303936",
+      "client_nonce": "c1234.0",
+      "client_proof": "7400d6ee83011ba9f361c3943c502f7fe98284dcd1be9f36282a24c435fe097f",
+      "iterations": 4096,
+      "password": "p@ss w0rd ✓",
+      "salt": "031425364758697a8b9cadbecfe0f102",
+      "salted_password": "af12b7171450162f888240b1ba172e706fe17bb20091f2b1bd3cb08c0af33400",
+      "server_nonce": "c1234.0srv-XYZ",
+      "server_signature": "be2cc811752b8cc591603df5f9d3f5c23be24c9b718ed9f84277ee92a774fcc3",
+      "username": "conform"
+    },
+    {
+      "auth_message": "616e6f6e796d6f757300632e3100632e31730030333134323533363437353836393761386239636164626563666530663130320031",
+      "client_nonce": "c.1",
+      "client_proof": "80f7e6b7207d5d1cd366bd34b7244cc71ec86a2251d672b99219e72871977360",
+      "iterations": 1,
+      "password": "",
+      "salt": "031425364758697a8b9cadbecfe0f102",
+      "salted_password": "f8853b0aff4d918180c72c13941764a460f232b75137c10d5760f87da0030208",
+      "server_nonce": "c.1s",
+      "server_signature": "b36ec4107f11fb12ffd508f730a6902612573684bd3f9e0425e62665034bf625",
+      "username": "anonymous"
+    },
+    {
+      "auth_message": "c3bc6ec3af63c3b664c3a900636e00636e736e0030303030303030303030303030303030003130",
+      "client_nonce": "cn",
+      "client_proof": "422072b6f7ead8f373c68bf422c29ead8919249afe15e9df1e9f82a7da9c9be3",
+      "iterations": 10,
+      "password": "pässwörd",
+      "salt": "0000000000000000",
+      "salted_password": "c57dfae2da43eb85742e86fefaca5aba043e39b3953bbe66f54fe12ff28160b2",
+      "server_nonce": "cnsn",
+      "server_signature": "1bffe11b727c655b6e5510d869e4a6e3f81d40e89c9e66efd5639c829a662c6e",
+      "username": "ünïcödé"
+    }
+  ],
+  "spec": "https://skaidb.org/docs/PROTOCOL.html",
+  "values": [
+    {
+      "encoded": "00",
+      "name": "null",
+      "value": {
+        "null": true
+      }
+    },
+    {
+      "encoded": "0101",
+      "name": "bool_true",
+      "value": {
+        "bool": true
+      }
+    },
+    {
+      "encoded": "0100",
+      "name": "bool_false",
+      "value": {
+        "bool": false
+      }
+    },
+    {
+      "encoded": "020000000000000000",
+      "name": "int_zero",
+      "value": {
+        "int": "0"
+      }
+    },
+    {
+      "encoded": "020100000000000000",
+      "name": "int_one",
+      "value": {
+        "int": "1"
+      }
+    },
+    {
+      "encoded": "02ffffffffffffffff",
+      "name": "int_minus_one",
+      "value": {
+        "int": "-1"
+      }
+    },
+    {
+      "encoded": "02ffffffffffffff7f",
+      "name": "int_max",
+      "value": {
+        "int": "9223372036854775807"
+      }
+    },
+    {
+      "encoded": "020000000000000080",
+      "name": "int_min",
+      "value": {
+        "int": "-9223372036854775808"
+      }
+    },
+    {
+      "encoded": "020100000000002000",
+      "name": "int_beyond_2_53",
+      "value": {
+        "int": "9007199254740993"
+      }
+    },
+    {
+      "encoded": "030000000000000000",
+      "name": "float_zero",
+      "value": {
+        "float": 0.0,
+        "float_bits": "0000000000000000"
+      }
+    },
+    {
+      "encoded": "030000000000000080",
+      "name": "float_negative_zero",
+      "value": {
+        "float": -0.0,
+        "float_bits": "8000000000000000"
+      }
+    },
+    {
+      "encoded": "03000000000000f83f",
+      "name": "float_one_and_half",
+      "value": {
+        "float": 1.5,
+        "float_bits": "3ff8000000000000"
+      }
+    },
+    {
+      "encoded": "03000000046bf414c2",
+      "name": "float_large_negative",
+      "value": {
+        "float": -22500000000.0,
+        "float_bits": "c214f46b04000000"
+      }
+    },
+    {
+      "encoded": "0359f3f8c21f6ea501",
+      "name": "float_tiny",
+      "value": {
+        "float": 1e-300,
+        "float_bits": "01a56e1fc2f8f359"
+      }
+    },
+    {
+      "encoded": "03555555555555d53f",
+      "name": "float_third",
+      "value": {
+        "float": 0.3333333333333333,
+        "float_bits": "3fd5555555555555"
+      }
+    },
+    {
+      "encoded": "043930000000000000000000000000000002000000",
+      "name": "decimal_cents",
+      "value": {
+        "decimal": {
+          "mantissa": "12345",
+          "scale": 2
+        }
+      }
+    },
+    {
+      "encoded": "04ffffffffffffffffffffffffffffffff00000000",
+      "name": "decimal_negative",
+      "value": {
+        "decimal": {
+          "mantissa": "-1",
+          "scale": 0
+        }
+      }
+    },
+    {
+      "encoded": "0407000040eaed7446d09c2c9f0c0000000a000000",
+      "name": "decimal_wide",
+      "value": {
+        "decimal": {
+          "mantissa": "1000000000000000000000000000007",
+          "scale": 10
+        }
+      }
+    },
+    {
+      "encoded": "0500000000",
+      "name": "string_empty",
+      "value": {
+        "string": ""
+      }
+    },
+    {
+      "encoded": "050500000068656c6c6f",
+      "name": "string_ascii",
+      "value": {
+        "string": "hello"
+      }
+    },
+    {
+      "encoded": "0510000000c3bc6ec3af63c3b664c3a920f09f9880",
+      "name": "string_unicode",
+      "value": {
+        "string": "ünïcödé 😀"
+      }
+    },
+    {
+      "encoded": "050d00000069742773202271756f74656422",
+      "name": "string_quote",
+      "value": {
+        "string": "it's \"quoted\""
+      }
+    },
+    {
+      "encoded": "0600000000",
+      "name": "bytes_empty",
+      "value": {
+        "bytes": ""
+      }
+    },
+    {
+      "encoded": "060500000000017f80ff",
+      "name": "bytes_binary",
+      "value": {
+        "bytes": "00017f80ff"
+      }
+    },
+    {
+      "encoded": "07123e4567e89b12d3a456426614174000",
+      "name": "uuid",
+      "value": {
+        "uuid": "123e4567-e89b-12d3-a456-426614174000"
+      }
+    },
+    {
+      "encoded": "080000000000000000",
+      "name": "timestamp_epoch",
+      "value": {
+        "timestamp_ms": "0"
+      }
+    },
+    {
+      "encoded": "087b68e5cf8b010000",
+      "name": "timestamp_recent",
+      "value": {
+        "timestamp_ms": "1700000000123"
+      }
+    },
+    {
+      "encoded": "0818fcffffffffffff",
+      "name": "timestamp_negative",
+      "value": {
+        "timestamp_ms": "-1000"
+      }
+    },
+    {
+      "encoded": "0900000000",
+      "name": "array_empty",
+      "value": {
+        "array": []
+      }
+    },
+    {
+      "encoded": "090300000002010000000000000005010000006100",
+      "name": "array_mixed",
+      "value": {
+        "array": [
+          {
+            "int": "1"
+          },
+          {
+            "string": "a"
+          },
+          {
+            "null": true
+          }
+        ]
+      }
+    },
+    {
+      "encoded": "0902000000090100000001010900000000",
+      "name": "array_nested",
+      "value": {
+        "array": [
+          {
+            "array": [
+              {
+                "bool": true
+              }
+            ]
+          },
+          {
+            "array": []
+          }
+        ]
+      }
+    },
+    {
+      "encoded": "0a00000000",
+      "name": "document_empty",
+      "value": {
+        "document": []
+      }
+    },
+    {
+      "encoded": "0a03000000010000006102010000000000000001000000620902000000010103000000000000044001000000630a0100000005000000696e6e6572050100000078",
+      "name": "document_nested",
+      "value": {
+        "document": [
+          {
+            "key": "a",
+            "value": {
+              "int": "1"
+            }
+          },
+          {
+            "key": "b",
+            "value": {
+              "array": [
+                {
+                  "bool": true
+                },
+                {
+                  "float": 2.5,
+                  "float_bits": "4004000000000000"
+                }
+              ]
+            }
+          },
+          {
+            "key": "c",
+            "value": {
+              "document": [
+                {
+                  "key": "inner",
+                  "value": {
+                    "string": "x"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

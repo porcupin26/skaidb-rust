@@ -69,6 +69,9 @@ pub struct Client {
     /// principal instead of SCRAM; `password` is unused. Retained so failover
     /// reconnects re-authenticate the same way.
     gssapi_spn: Option<String>,
+    /// Authenticate with the TLS client certificate (EXTERNAL) instead of a
+    /// password; retained so failover reconnects do the same.
+    cert_auth: bool,
     /// The endpoint the live `stream` is connected to.
     connected: String,
     stream: skaidb_net::Stream,
@@ -129,6 +132,29 @@ impl TlsConfig {
             server_name: server_name.to_string(),
         })
     }
+
+    /// [`TlsConfig::new`] that also presents a client certificate (PEM
+    /// `cert_file` + `key_file`) — the credential for
+    /// [`Client::connect_certificate`], and accepted by any server that
+    /// requests one.
+    pub fn with_client_cert(
+        verify: TlsVerify,
+        server_name: &str,
+        cert_file: &str,
+        key_file: &str,
+    ) -> Result<TlsConfig, DriverError> {
+        let v = match verify {
+            TlsVerify::CaFile(p) => skaidb_net::ClientVerify::CaFile(p),
+            TlsVerify::System => skaidb_net::ClientVerify::WebpkiDefaults,
+            TlsVerify::Insecure => skaidb_net::ClientVerify::Insecure,
+        };
+        let cfg = skaidb_net::client_config(v, Some((cert_file, key_file)))
+            .map_err(|e| DriverError::Io(io::Error::new(io::ErrorKind::InvalidInput, e)))?;
+        Ok(TlsConfig {
+            cfg,
+            server_name: server_name.to_string(),
+        })
+    }
 }
 
 impl Client {
@@ -176,7 +202,7 @@ impl Client {
         password: &str,
         tls: Option<TlsConfig>,
     ) -> Result<Client, DriverError> {
-        Client::connect_inner(endpoints, username, password, None, tls)
+        Client::connect_mode(endpoints, username, password, None, false, tls)
     }
 
     /// Connect authenticating with Kerberos (SASL GSSAPI) instead of a
@@ -193,7 +219,21 @@ impl Client {
         target_spn: &str,
         tls: Option<TlsConfig>,
     ) -> Result<Client, DriverError> {
-        Client::connect_inner(endpoints, principal, "", Some(target_spn.to_string()), tls)
+        Client::connect_mode(endpoints, principal, "", Some(target_spn.to_string()), false, tls)
+    }
+
+    /// Authenticate with the TLS client certificate (SASL EXTERNAL): the
+    /// server maps the certificate's subject Common Name to a user, with no
+    /// password. `tls` must present a certificate
+    /// ([`TlsConfig::with_client_cert`]) and the server must run with
+    /// `auth.x509_enabled`. `username` is optional — empty, or it must equal
+    /// the certificate's Common Name.
+    pub fn connect_certificate(
+        endpoints: &[String],
+        username: &str,
+        tls: TlsConfig,
+    ) -> Result<Client, DriverError> {
+        Client::connect_mode(endpoints, username, "", None, true, Some(tls))
     }
 
     /// Plaintext [`Client::connect_gssapi_tls`].
@@ -207,11 +247,12 @@ impl Client {
 
     /// Shared connect path: order endpoints by latency and dial each until one
     /// authenticates, via SCRAM (`gssapi_spn = None`) or GSSAPI (`Some(spn)`).
-    fn connect_inner(
+    fn connect_mode(
         endpoints: &[String],
         username: &str,
         password: &str,
         gssapi_spn: Option<String>,
+        cert_auth: bool,
         tls: Option<TlsConfig>,
     ) -> Result<Client, DriverError> {
         let ordered = order_by_latency(&dedup(endpoints));
@@ -220,7 +261,7 @@ impl Client {
         }
         let mut last = String::new();
         for ep in &ordered {
-            match dial(ep, username, password, gssapi_spn.as_deref(), tls.as_ref()) {
+            match dial(ep, username, password, gssapi_spn.as_deref(), cert_auth, tls.as_ref()) {
                 Ok(stream) => {
                     let connected = ep.clone();
                     return Ok(Client {
@@ -228,6 +269,7 @@ impl Client {
                         username: username.to_string(),
                         password: password.to_string(),
                         gssapi_spn,
+                        cert_auth,
                         connected,
                         stream,
                         tls,
@@ -735,6 +777,7 @@ impl Client {
                 &self.username,
                 &self.password,
                 self.gssapi_spn.as_deref(),
+                self.cert_auth,
                 self.tls.as_ref(),
             ) {
                 Ok(stream) => {
@@ -828,12 +871,14 @@ impl Drop for RowStream<'_> {
 }
 
 /// Open a TCP connection to `endpoint` and run the client handshake — GSSAPI
-/// when `gssapi_spn` is set, otherwise SCRAM.
+/// when `gssapi_spn` is set, the client certificate when `cert_auth`,
+/// otherwise SCRAM.
 fn dial(
     endpoint: &str,
     username: &str,
     password: &str,
     gssapi_spn: Option<&str>,
+    cert_auth: bool,
     tls: Option<&TlsConfig>,
 ) -> Result<skaidb_net::Stream, DriverError> {
     let tcp = TcpStream::connect(endpoint)?;
@@ -844,9 +889,31 @@ fn dial(
     };
     match gssapi_spn {
         Some(spn) => handshake_gssapi(&mut stream, username, spn)?,
+        None if cert_auth => handshake_external(&mut stream, username)?,
         None => handshake(&mut stream, username, password)?,
     }
     Ok(stream)
+}
+
+/// Client side of EXTERNAL: announce the mechanism and read the outcome —
+/// the certificate presented during the TLS handshake is the credential.
+fn handshake_external<S: io::Read + io::Write>(
+    stream: &mut S,
+    username: &str,
+) -> Result<(), DriverError> {
+    write_frame(
+        stream,
+        &AuthStart {
+            username: username.to_string(),
+            client_nonce: String::new(),
+            mechanism: AuthMechanism::External,
+        }
+        .encode(),
+    )?;
+    match AuthOutcome::decode(&read_frame(stream)?)? {
+        AuthOutcome::Ok { .. } => Ok(()),
+        AuthOutcome::Denied { reason } => Err(DriverError::Auth(reason)),
+    }
 }
 
 /// Client side of the GSSAPI handshake: announce the mechanism, send the first

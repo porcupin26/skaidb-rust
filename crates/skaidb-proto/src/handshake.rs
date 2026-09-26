@@ -43,6 +43,12 @@ pub enum AuthMechanism {
     /// Kerberos via SASL GSSAPI: a token-exchange context negotiation, no
     /// password. The authenticated principal maps to an external user's role.
     Gssapi,
+    /// SASL EXTERNAL: the verified TLS client certificate is the credential
+    /// (its subject Common Name is the username). No exchange follows the
+    /// `AuthStart`; the server answers `AuthOutcome` directly, with an
+    /// all-zero server signature the client does not check (there was no
+    /// shared secret to sign with — TLS authenticated the server).
+    External,
 }
 
 impl AuthMechanism {
@@ -50,12 +56,14 @@ impl AuthMechanism {
         match self {
             AuthMechanism::ScramSha256 => 0,
             AuthMechanism::Gssapi => 1,
+            AuthMechanism::External => 2,
         }
     }
     fn from_byte(b: u8) -> Result<Self, ProtoError> {
         match b {
             0 => Ok(AuthMechanism::ScramSha256),
             1 => Ok(AuthMechanism::Gssapi),
+            2 => Ok(AuthMechanism::External),
             _ => Err(ProtoError::Malformed("unknown auth mechanism")),
         }
     }

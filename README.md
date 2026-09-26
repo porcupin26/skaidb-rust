@@ -23,7 +23,7 @@ is tested with:
 
 ```toml
 [dependencies]
-skaidb = "0.294"
+skaidb = "0.308"
 ```
 
 Kerberos (GSSAPI) logins are behind the `kerberos` feature, which links the
@@ -32,7 +32,7 @@ MIT krb5 library through `cross-krb5`. Install the development headers first
 macOS and Windows) and enable the feature:
 
 ```toml
-skaidb = { version = "0.294", features = ["kerberos"] }
+skaidb = { version = "0.308", features = ["kerberos"] }
 ```
 
 The feature is off by default and never builds on static musl targets.

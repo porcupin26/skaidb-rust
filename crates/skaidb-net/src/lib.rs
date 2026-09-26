@@ -81,7 +81,10 @@ impl Stream {
     pub fn peer_certificate_der(&self) -> Option<Vec<u8>> {
         match self {
             Stream::ClientTls(s) => s.conn.peer_certificates()?.first().map(|c| c.to_vec()),
-            _ => None,
+            // Server side: the client's certificate, present only when the
+            // listener asked for one and the chain verified.
+            Stream::ServerTls(s) => s.conn.peer_certificates()?.first().map(|c| c.to_vec()),
+            Stream::Plain(_) => None,
         }
     }
 
@@ -182,6 +185,10 @@ impl Conn {
     }
     pub fn is_tls(&self) -> bool {
         self.stream.get_ref().is_tls()
+    }
+    /// See [`Stream::peer_certificate_der`].
+    pub fn peer_certificate_der(&self) -> Option<Vec<u8>> {
+        self.stream.get_ref().peer_certificate_der()
     }
     pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         self.stream.get_ref().peer_addr()

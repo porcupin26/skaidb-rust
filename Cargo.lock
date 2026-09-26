@@ -443,9 +443,10 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "skaidb"
-version = "0.294.2"
+version = "0.308.0"
 dependencies = [
  "rustls",
+ "serde_json",
  "skaidb-auth",
  "skaidb-gssapi",
  "skaidb-net",
@@ -456,14 +457,14 @@ dependencies = [
 
 [[package]]
 name = "skaidb-auth"
-version = "0.294.2"
+version = "0.308.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "skaidb-ffi"
-version = "0.294.2"
+version = "0.308.0"
 dependencies = [
  "serde_json",
  "skaidb",
@@ -473,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-gssapi"
-version = "0.294.2"
+version = "0.308.0"
 dependencies = [
  "cross-krb5",
  "thiserror",
@@ -481,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-net"
-version = "0.294.2"
+version = "0.308.0"
 dependencies = [
  "rcgen",
  "ring",
@@ -492,7 +493,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-proto"
-version = "0.294.2"
+version = "0.308.0"
 dependencies = [
  "skaidb-types",
  "thiserror",
@@ -500,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-types"
-version = "0.294.2"
+version = "0.308.0"
 dependencies = [
  "serde",
  "serde_json",

@@ -1,6 +1,6 @@
 [package]
 name = "skaidb-ffi"
-version = "0.294.2"
+version = "0.308.0"
 edition = "2021"
 license = "SSPL-1.0"
 repository = "https://github.com/porcupin26/skaidb-rust"
@@ -34,7 +34,7 @@ default = []
 kerberos = ["skaidb/kerberos"]
 
 [dependencies]
-skaidb = { path = "../..", version = "0.294.2" }
-skaidb-types = { path = "../skaidb-types", version = "0.294.2" }
-skaidb-proto = { path = "../skaidb-proto", version = "0.294.2" }
+skaidb = { path = "../..", version = "0.308.0" }
+skaidb-types = { path = "../skaidb-types", version = "0.308.0" }
+skaidb-proto = { path = "../skaidb-proto", version = "0.308.0" }
 serde_json.workspace = true

@@ -3,6 +3,10 @@
 Each entry is a sync of the skaidb monorepo at that version; the driver's
 features and fixes ship with skaidb releases (see <https://skaidb.org>).
 
+## v0.308.0 — 2026-09-26
+
+Mirror of skaidb 0.308.0.
+
 ## v0.294.2 — 2026-09-20
 
 Mirror of skaidb 0.294.2.

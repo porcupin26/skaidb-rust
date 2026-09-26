@@ -22,6 +22,20 @@ enum Sink {
 
 static SERVER_LOG: OnceLock<Sink> = OnceLock::new();
 
+/// A process-wide observer of every server-log line, installed once by the
+/// advisor's signal collector: it sees the message BEFORE it is written and
+/// must be cheap and must never log (it would recurse). Best-effort like
+/// the log itself.
+static LOG_OBSERVER: OnceLock<LogObserver> = OnceLock::new();
+
+/// The observer's shape: a cheap, non-logging callback per line.
+pub type LogObserver = Box<dyn Fn(&str) + Send + Sync>;
+
+/// Install the [`LOG_OBSERVER`]. The first call wins; later calls are no-ops.
+pub fn set_log_observer(observer: LogObserver) {
+    let _ = LOG_OBSERVER.set(observer);
+}
+
 /// Point the server log at `path` (empty = stderr). Idempotent: only the first
 /// call wins, so it should run once early in startup, before workers spawn. A
 /// path that can't be opened logs the reason once and stays on stderr.
@@ -144,6 +158,9 @@ pub fn push_u64(out: &mut String, n: u64) {
 /// Best-effort: a write error is dropped rather than
 /// taking down the server. Prefer the [`slog!`] macro at call sites.
 pub fn server_log(msg: &str) {
+    if let Some(observer) = LOG_OBSERVER.get() {
+        observer(msg);
+    }
     let ts = log_timestamp();
     match SERVER_LOG.get() {
         Some(Sink::File(f)) => {
