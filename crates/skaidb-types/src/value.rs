@@ -58,9 +58,53 @@ impl Decimal {
         Decimal { mantissa, scale }
     }
 
+    /// Largest scale `Display` renders positionally (`0.000…d`). Past it
+    /// the exact value is written in scientific notation,
+    /// `<mantissa>E-<scale>` (`1E-70000`): a positional rendering is
+    /// `scale` characters long — gigabytes at the scales a `u32` admits —
+    /// and the formatter's padding width stops at `u16::MAX` anyway. Every
+    /// `u32` scale is stored and shipped unchanged (the codec is a fixed
+    /// 16 + 4 bytes); only the text form switches.
+    pub const MAX_PLAIN_SCALE: u32 = 1_000;
+
     /// Lossy projection to `f64`, used for ordering and arithmetic interop.
     pub fn to_f64(self) -> f64 {
-        self.mantissa as f64 / 10f64.powi(self.scale as i32)
+        // `powi` takes an `i32`. Anything past ~10^308 is infinite, so a
+        // scale beyond a few hundred projects to ±0 whatever its size;
+        // clamping keeps that true instead of letting `as i32` wrap a huge
+        // scale negative (1E-3000000000 came out as +inf).
+        let scale = self.scale.min(2 * Self::MAX_PLAIN_SCALE) as i32;
+        self.mantissa as f64 / 10f64.powi(scale)
+    }
+
+    /// The same number with no trailing zeros in its mantissa (`1.00` →
+    /// `1`, `0.000` → `0`, `-2.50` → `-2.5`): every representation of one
+    /// value normalises to one `(mantissa, scale)`, so equal decimals meet
+    /// on it and distinct ones never do. `1E-70000` stays as it is (its
+    /// mantissa has no trailing zero to drop).
+    pub fn normalized(self) -> Decimal {
+        let (mut mantissa, mut scale) = (self.mantissa, self.scale);
+        if mantissa == 0 {
+            return Decimal { mantissa: 0, scale: 0 };
+        }
+        while scale > 0 && mantissa % 10 == 0 {
+            mantissa /= 10;
+            scale -= 1;
+        }
+        Decimal { mantissa, scale }
+    }
+
+    /// The exact, canonical bytes of this number: its normalised mantissa
+    /// (big-endian `i128`) and scale (big-endian `u32`), 20 bytes. Equal
+    /// decimals give equal bytes and distinct ones distinct bytes, which
+    /// the `f64` projection [`Value::encode_key`] orders by cannot promise
+    /// (`1.000000001` and `1.0000000010000000001` project to one float).
+    pub fn exact_bytes(self) -> [u8; 20] {
+        let n = self.normalized();
+        let mut out = [0u8; 20];
+        out[..16].copy_from_slice(&n.mantissa.to_be_bytes());
+        out[16..].copy_from_slice(&n.scale.to_be_bytes());
+        out
     }
 }
 
@@ -69,22 +113,26 @@ impl fmt::Display for Decimal {
         if self.scale == 0 {
             return write!(f, "{}", self.mantissa);
         }
-        let neg = self.mantissa < 0;
+        let sign = if self.mantissa < 0 { "-" } else { "" };
         let digits = self.mantissa.unsigned_abs().to_string();
+        if self.scale > Self::MAX_PLAIN_SCALE {
+            return write!(f, "{sign}{digits}E-{}", self.scale);
+        }
         let scale = self.scale as usize;
-        let padded = if digits.len() <= scale {
-            format!("{:0>width$}", digits, width = scale + 1)
+        if digits.len() <= scale {
+            // `0.` then the zeros up to the first significant digit, written
+            // piecewise: `{:0>width$}` panics past a width of `u16::MAX`
+            // ("Formatting argument out of range"), which is how a bound
+            // `Decimal('1E-70000')` used to drop the connection.
+            write!(f, "{sign}0.")?;
+            for _ in digits.len()..scale {
+                f.write_str("0")?;
+            }
+            f.write_str(&digits)
         } else {
-            digits
-        };
-        let split = padded.len() - scale;
-        write!(
-            f,
-            "{}{}.{}",
-            if neg { "-" } else { "" },
-            &padded[..split],
-            &padded[split..]
-        )
+            let split = digits.len() - scale;
+            write!(f, "{sign}{}.{}", &digits[..split], &digits[split..])
+        }
     }
 }
 
@@ -303,6 +351,58 @@ impl Value {
         }
     }
 
+    /// An EXACT equality key: [`Value::encode_key`] except that a decimal,
+    /// at any depth, encodes its canonical [`Decimal::exact_bytes`] (as an
+    /// escaped, terminated byte string after the decimal tag) instead of
+    /// its lossy `f64` projection. Two values give one key exactly when
+    /// they are equal (`1.0`, `1.00` and `1` as a decimal meet; `1.0` and
+    /// `1.000000001` never do), and the code stays prefix-free, so a tuple
+    /// of several components decodes one way. Not order-preserving across
+    /// decimals and not an index entry format: for keys compared by
+    /// equality only (a UNIQUE reservation).
+    pub fn encode_exact_key(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.encode_exact_into(&mut out);
+        out
+    }
+
+    /// Append [`Value::encode_exact_key`] to `out`.
+    pub fn encode_exact_into(&self, out: &mut Vec<u8>) {
+        match self {
+            Value::Decimal(d) => {
+                out.push(tag::DECIMAL);
+                encode_bytes(&d.exact_bytes(), out);
+            }
+            Value::Array(items) => {
+                out.push(tag::ARRAY);
+                for item in items {
+                    item.encode_exact_into(out);
+                }
+                out.push(tag::END);
+            }
+            Value::Document(doc) => {
+                out.push(tag::DOCUMENT);
+                for (k, v) in &doc.0 {
+                    encode_bytes(k.as_bytes(), out);
+                    v.encode_exact_into(out);
+                }
+                out.push(tag::END);
+            }
+            scalar => scalar.encode_into(out),
+        }
+    }
+
+    /// Whether a decimal occurs in this value at any depth (the one case
+    /// where [`Value::encode_exact_key`] and [`Value::encode_key`] differ).
+    pub fn contains_decimal(&self) -> bool {
+        match self {
+            Value::Decimal(_) => true,
+            Value::Array(items) => items.iter().any(Value::contains_decimal),
+            Value::Document(doc) => doc.0.values().any(Value::contains_decimal),
+            _ => false,
+        }
+    }
+
     /// Append the order-preserving ARRAY key of the given components to
     /// `out` — byte-identical to `Value::Array(items.to_vec()).encode_key()`
     /// without materializing the array or cloning a component. This is the
@@ -326,6 +426,82 @@ impl Value {
     pub fn total_cmp(&self, other: &Value) -> Ordering {
         self.encode_key().cmp(&other.encode_key())
     }
+}
+
+/// The type-tag byte a value's order-preserving key encoding starts with —
+/// the byte index entries of one type share, and by which a key range
+/// groups values (`NULL` lowest, then bool, int, float, decimal, string,
+/// bytes, uuid, timestamp, array, document).
+pub fn key_tag(v: &Value) -> u8 {
+    match v {
+        Value::Null => tag::NULL,
+        Value::Bool(_) => tag::BOOL,
+        Value::Int(_) => tag::INT,
+        Value::Float(_) => tag::FLOAT,
+        Value::Decimal(_) => tag::DECIMAL,
+        Value::String(_) => tag::STRING,
+        Value::Bytes(_) => tag::BYTES,
+        Value::Uuid(_) => tag::UUID,
+        Value::Timestamp(_) => tag::TIMESTAMP,
+        Value::Array(_) => tag::ARRAY,
+        Value::Document(_) => tag::DOCUMENT,
+    }
+}
+
+/// Decode the NUMERIC value an order-preserving key component starts with
+/// (`component` begins at the component's type tag): the exact `Int` or
+/// `Timestamp`, the exact `Float`, or — for a `Decimal`, which is keyed by
+/// its `f64` projection — that projection as a `Float`. `None` for any
+/// other tag or a truncated component. The inverse of
+/// [`Value::encode_into`] for the numeric types, for walks that must order
+/// index entries of different numeric types by value.
+pub fn decode_numeric_key(component: &[u8]) -> Option<Value> {
+    let (&t, rest) = component.split_first()?;
+    let raw = u64::from_be_bytes(rest.get(..8)?.try_into().ok()?);
+    const SIGN: u64 = 0x8000_0000_0000_0000;
+    let float = || {
+        // Inverse of `encode_f64`: positives had the sign bit set,
+        // negatives were inverted.
+        f64::from_bits(if raw & SIGN != 0 { raw ^ SIGN } else { !raw })
+    };
+    match t {
+        tag::INT => Some(Value::Int((raw ^ SIGN) as i64)),
+        tag::TIMESTAMP => Some(Value::Timestamp((raw ^ SIGN) as i64)),
+        tag::FLOAT | tag::DECIMAL => Some(Value::Float(float())),
+        _ => None,
+    }
+}
+
+/// Exact comparison of a 64-bit integer with a double: the mathematical
+/// order of the two numbers, with no rounding of the integer. An `i64`
+/// beyond 2^53 has no exact `f64`, so comparing through `i as f64` makes
+/// neighbouring integers (snowflake ids, nanosecond timestamps) equal to
+/// one double and to each other. `None` when `f` is NaN.
+pub fn cmp_i64_f64(i: i64, f: f64) -> Option<Ordering> {
+    if f.is_nan() {
+        return None;
+    }
+    // ±2^63 are exact doubles; everything in [-2^63, 2^63) truncates to an
+    // `i64` without loss.
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+    if f >= TWO_63 {
+        return Some(Ordering::Less);
+    }
+    if f < -TWO_63 {
+        return Some(Ordering::Greater);
+    }
+    let whole = f.trunc();
+    Some(match i.cmp(&(whole as i64)) {
+        // Same integer part: the fraction (which carries `f`'s sign) decides.
+        Ordering::Equal => 0.0f64.partial_cmp(&(f - whole)).unwrap_or(Ordering::Equal),
+        other => other,
+    })
+}
+
+/// Whether `i` is exactly representable as an `f64` (so `i as f64` loses
+/// nothing and some double can equal it).
+pub fn i64_is_exact_f64(i: i64) -> bool {
+    (i as f64) as i128 == i128::from(i)
 }
 
 /// The byte slice of `key` covering the array tag plus the first `n`
@@ -435,6 +611,74 @@ mod tests {
     }
 
     #[test]
+    fn numeric_key_components_decode_back() {
+        for v in [
+            Value::Int(0),
+            Value::Int(-1),
+            Value::Int(i64::MIN),
+            Value::Int(i64::MAX),
+            Value::Timestamp(1_700_000_000_000),
+            Value::Float(0.5),
+            Value::Float(-0.0),
+            Value::Float(-1.5e300),
+            Value::Float(f64::INFINITY),
+        ] {
+            let key = v.encode_key();
+            assert_eq!(key[0], key_tag(&v));
+            assert_eq!(decode_numeric_key(&key), Some(v.clone()), "{v:?}");
+        }
+        // A decimal is keyed by its f64 projection.
+        let d = Value::Decimal(Decimal::new(125, 2));
+        assert_eq!(decode_numeric_key(&d.encode_key()), Some(Value::Float(1.25)));
+        assert_eq!(decode_numeric_key(&Value::String("x".into()).encode_key()), None);
+        assert_eq!(decode_numeric_key(&[tag::INT, 1, 2]), None);
+        // Tags ascend in the documented order.
+        let order = [
+            Value::Null,
+            Value::Bool(false),
+            Value::Int(0),
+            Value::Float(0.0),
+            Value::Decimal(Decimal::new(0, 0)),
+            Value::String(String::new()),
+            Value::Bytes(Vec::new()),
+            Value::Uuid(Uuid::NIL),
+            Value::Timestamp(0),
+            Value::Array(Vec::new()),
+            Value::Document(Document::new()),
+        ];
+        assert!(order.windows(2).all(|w| key_tag(&w[0]) < key_tag(&w[1])));
+    }
+
+    #[test]
+    fn int_float_comparison_is_exact_beyond_2_pow_53() {
+        use Ordering::*;
+        let two53 = 9_007_199_254_740_992i64;
+        // 2^53 + 1 rounds to 2^53 as a double; the integers still differ.
+        assert_eq!(cmp_i64_f64(two53 + 1, two53 as f64), Some(Greater));
+        assert_eq!(cmp_i64_f64(two53, two53 as f64), Some(Equal));
+        assert_eq!(cmp_i64_f64(-two53 - 1, -(two53 as f64)), Some(Less));
+        // Fractions on either side of zero.
+        assert_eq!(cmp_i64_f64(1, 1.5), Some(Less));
+        assert_eq!(cmp_i64_f64(2, 1.5), Some(Greater));
+        assert_eq!(cmp_i64_f64(-1, -1.5), Some(Greater));
+        assert_eq!(cmp_i64_f64(-2, -1.5), Some(Less));
+        assert_eq!(cmp_i64_f64(0, -0.0), Some(Equal));
+        assert_eq!(cmp_i64_f64(0, 0.25), Some(Less));
+        assert_eq!(cmp_i64_f64(0, -0.25), Some(Greater));
+        // The ends of the range, infinities and NaN.
+        assert_eq!(cmp_i64_f64(i64::MAX, 9_223_372_036_854_775_808.0), Some(Less));
+        assert_eq!(cmp_i64_f64(i64::MAX, 9_223_372_036_854_774_784.0), Some(Greater));
+        assert_eq!(cmp_i64_f64(i64::MIN, -9_223_372_036_854_775_808.0), Some(Equal));
+        assert_eq!(cmp_i64_f64(i64::MIN, f64::NEG_INFINITY), Some(Greater));
+        assert_eq!(cmp_i64_f64(i64::MAX, f64::INFINITY), Some(Less));
+        assert_eq!(cmp_i64_f64(7, f64::NAN), None);
+        assert!(i64_is_exact_f64(two53));
+        assert!(!i64_is_exact_f64(two53 + 1));
+        assert!(!i64_is_exact_f64(i64::MAX));
+        assert!(i64_is_exact_f64(i64::MIN));
+    }
+
+    #[test]
     fn int_order_preserved() {
         assert_eq!(cmp(Value::Int(-5), Value::Int(3)), Ordering::Less);
         assert_eq!(
@@ -501,6 +745,58 @@ mod tests {
         assert_eq!(Decimal::new(5, 3).to_string(), "0.005");
         assert_eq!(Decimal::new(-5, 3).to_string(), "-0.005");
         assert_eq!(Decimal::new(42, 0).to_string(), "42");
+    }
+
+    /// The exact key meets on equal decimals whatever their scale and
+    /// separates decimals the f64 projection collapses; other values
+    /// encode as `encode_key` does.
+    #[test]
+    fn exact_key_is_canonical_for_decimals() {
+        let dec = |m: i128, s: u32| Value::Array(vec![Value::Decimal(Decimal::new(m, s))]);
+        assert_eq!(dec(10, 1).encode_exact_key(), dec(100, 2).encode_exact_key(), "1.0 == 1.00");
+        assert_eq!(dec(1, 0).encode_exact_key(), dec(1_000_000, 6).encode_exact_key(), "1 == 1.000000");
+        assert_eq!(dec(0, 5).encode_exact_key(), dec(0, 0).encode_exact_key(), "0.00000 == 0");
+        assert_ne!(dec(10, 1).encode_exact_key(), dec(1_000_000_001, 9).encode_exact_key(), "1.0 != 1.000000001");
+        // Two decimals one f64 apart: the projection collides, the exact key does not.
+        let a = Decimal::new(1_000_000_001, 9);
+        let b = Decimal::new(10_000_000_010_000_000_001, 19);
+        assert_eq!(Value::Decimal(a).encode_key(), Value::Decimal(b).encode_key());
+        assert_ne!(Value::Decimal(a).encode_exact_key(), Value::Decimal(b).encode_exact_key());
+        // A decimal never meets another type, and non-decimals are unchanged.
+        assert_ne!(dec(1, 0).encode_exact_key(), Value::Array(vec![Value::Int(1)]).encode_exact_key());
+        let mixed = Value::Array(vec![Value::String("a".into()), Value::Int(7), Value::Null]);
+        assert_eq!(mixed.encode_exact_key(), mixed.encode_key());
+        assert!(!mixed.contains_decimal());
+        assert!(Value::Array(vec![Value::Document(Document::new().insert("d", Value::Decimal(a)).clone())]).contains_decimal());
+        assert_eq!(Decimal::new(-250, 2).normalized(), Decimal::new(-25, 1));
+    }
+
+    /// A bound `Decimal('1E-70000')` read back as text panicked the
+    /// formatter (`{:0>width$}` stops at `u16::MAX`) and dropped the
+    /// connection. Rendering is total now: positional up to
+    /// `MAX_PLAIN_SCALE`, exact scientific notation beyond, at any `u32`.
+    #[test]
+    fn decimal_display_is_total_at_any_scale() {
+        assert_eq!(Decimal::new(1, 70_000).to_string(), "1E-70000");
+        assert_eq!(Decimal::new(-15, u32::MAX).to_string(), "-15E-4294967295");
+        assert_eq!(Decimal::new(123, 65_536).to_string(), "123E-65536");
+        assert_eq!(Decimal::new(0, 5_000).to_string(), "0E-5000");
+        // Positional right up to the bound, zero-padded exactly.
+        let s = Decimal::new(7, Decimal::MAX_PLAIN_SCALE).to_string();
+        assert_eq!(s.len(), Decimal::MAX_PLAIN_SCALE as usize + 2);
+        assert!(s.starts_with("0.000") && s.ends_with("07"), "{s}");
+        assert_eq!(Decimal::new(-7, Decimal::MAX_PLAIN_SCALE + 1).to_string(), "-7E-1001");
+        // Value's Display and JSON forms ride on the same rendering.
+        assert_eq!(Value::Decimal(Decimal::new(1, 70_000)).to_string(), "1E-70000");
+        assert_eq!(
+            Value::Decimal(Decimal::new(1, 70_000)).to_json(),
+            serde_json::json!("1E-70000")
+        );
+        // The f64 projection clamps instead of wrapping the exponent.
+        assert_eq!(Decimal::new(1, 70_000).to_f64(), 0.0);
+        assert_eq!(Decimal::new(1, u32::MAX).to_f64(), 0.0);
+        assert!(Decimal::new(-1, 3_000_000_000).to_f64().is_sign_negative());
+        assert_eq!(Decimal::new(12345, 2).to_f64(), 123.45);
     }
 
     fn pk_key(vals: Vec<Value>) -> Vec<u8> {

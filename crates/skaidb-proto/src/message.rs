@@ -332,7 +332,7 @@ impl ClientRequest {
                     .ok_or(ProtoError::Malformed("bad consistency"))?;
                 let id = c.u32()?;
                 let nparams = u16::from_le_bytes(c.take(2)?.try_into().unwrap()) as usize;
-                let mut params = Vec::with_capacity(nparams);
+                let mut params = Vec::with_capacity(nparams.min(c.remaining() / 4));
                 for _ in 0..nparams {
                     let bytes = c.bytes()?;
                     params.push(
@@ -356,11 +356,11 @@ impl ClientRequest {
                     .ok_or(ProtoError::Malformed("bad consistency"))?;
                 let id = c.u32()?;
                 let nrows = c.u32()? as usize;
-                let mut rows = Vec::with_capacity(nrows.min(1 << 16));
+                let mut rows = Vec::with_capacity(nrows.min(c.remaining() / 2).min(1 << 16));
                 for _ in 0..nrows {
                     let nparams =
                         u16::from_le_bytes(c.take(2)?.try_into().unwrap()) as usize;
-                    let mut params = Vec::with_capacity(nparams);
+                    let mut params = Vec::with_capacity(nparams.min(c.remaining() / 4));
                     for _ in 0..nparams {
                         let bytes = c.bytes()?;
                         params.push(
@@ -522,7 +522,7 @@ fn encode_row_into(out: &mut Vec<u8>, row: &[Value]) {
 
 fn decode_columns(c: &mut Cursor) -> Result<Vec<String>, ProtoError> {
     let ncols = c.u32()? as usize;
-    let mut columns = Vec::with_capacity(ncols);
+    let mut columns = Vec::with_capacity(ncols.min(c.remaining() / 4));
     for _ in 0..ncols {
         columns.push(c.string()?);
     }
@@ -531,10 +531,10 @@ fn decode_columns(c: &mut Cursor) -> Result<Vec<String>, ProtoError> {
 
 fn decode_rows(c: &mut Cursor) -> Result<Vec<Vec<Value>>, ProtoError> {
     let nrows = c.u32()? as usize;
-    let mut rows = Vec::with_capacity(nrows);
+    let mut rows = Vec::with_capacity(nrows.min(c.remaining() / 4));
     for _ in 0..nrows {
         let cells = c.u32()? as usize;
-        let mut row = Vec::with_capacity(cells);
+        let mut row = Vec::with_capacity(cells.min(c.remaining() / 4));
         for _ in 0..cells {
             let bytes = c.bytes()?;
             let v =
@@ -590,6 +590,14 @@ struct Cursor<'a> {
 impl<'a> Cursor<'a> {
     fn new(buf: &'a [u8]) -> Self {
         Cursor { buf, pos: 0 }
+    }
+
+    /// Bytes not yet consumed. Every element count read off the wire is
+    /// capped by it before a `Vec` is sized — each element costs at least
+    /// a length prefix, so a count the bytes cannot hold is a forgery, and
+    /// a decoder must not reserve memory on a peer's say-so.
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], ProtoError> {
@@ -834,5 +842,26 @@ mod tests {
             decode_tagged_response(&plain.encode()).unwrap(),
             (None, plain)
         );
+    }
+
+    /// Fuzz `proto_client` (F-4): every element count off the wire is
+    /// capped by the bytes left before a `Vec` is sized, so a 2-byte
+    /// request claiming 65,535 parameters, or a response claiming 4G
+    /// columns or rows, is a clean `Malformed` instead of a reservation
+    /// on the peer's say-so.
+    #[test]
+    fn forged_counts_do_not_preallocate() {
+        // OP_EXECUTE: consistency, id, nparams = 0xFFFF, then nothing.
+        let req = [OP_EXECUTE, 0, 1, 0, 0, 0, 0xff, 0xff];
+        assert!(ClientRequest::decode(&req).is_err());
+        // OP_EXECUTE_BATCH: nrows = 0xFFFFFFFF, first row claims 0xFFFF params.
+        let req = [OP_EXECUTE_BATCH, 0, 1, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert!(ClientRequest::decode(&req).is_err());
+        // RESP_ROWS: ncols = 0xFFFFFFFF.
+        let resp = [RESP_ROWS, 0xff, 0xff, 0xff, 0xff];
+        assert!(Response::decode(&resp).is_err());
+        // RESP_ROWS_CHUNK: nrows = 0xFFFFFFFF, first row claims 0xFFFFFFFF cells.
+        let resp = [RESP_ROWS_CHUNK, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert!(Response::decode(&resp).is_err());
     }
 }

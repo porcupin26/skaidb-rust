@@ -89,6 +89,9 @@ impl Value {
             ));
         }
         let n = cur.u32()? as usize;
+        if n > cur.remaining() / 5 {
+            return Err(ValueError::UnrepresentableJson("document field count exceeds input"));
+        }
         let mut doc = Document::new();
         // Small `wanted` sets — the common projection — compare field names
         // as RAW BYTES against each wanted key: no UTF-8 validation and no
@@ -127,6 +130,53 @@ impl Value {
                 } else {
                     skip_value(&mut cur)?;
                 }
+            }
+        }
+        if cur.pos != bytes.len() {
+            return Err(ValueError::UnrepresentableJson(
+                "trailing bytes after value",
+            ));
+        }
+        Ok(doc)
+    }
+
+    /// [`Value::decode_document_projected`] that also PROBES the `probed`
+    /// fields: one holding NULL decodes as NULL, any other value as
+    /// `Value::Bool(true)`, skip-parsed and never materialized — for a
+    /// filter that tests those fields only with `IS [NOT] NULL` (a
+    /// 512-float vector was decoded on every row to answer `emb IS NULL`).
+    /// The caller guarantees nothing else reads a probed field's value;
+    /// `wanted` and the reserved fields decode as in the projected decode.
+    pub fn decode_document_probed(
+        bytes: &[u8],
+        wanted: &std::collections::HashSet<String>,
+        probed: &std::collections::HashSet<String>,
+    ) -> Result<Document, ValueError> {
+        let mut cur = Cursor { bytes, pos: 0 };
+        let t = cur.u8()?;
+        if t != tag::DOCUMENT {
+            return Err(ValueError::UnrepresentableJson(
+                "decode_document_probed: not a document",
+            ));
+        }
+        let n = cur.u32()? as usize;
+        if n > cur.remaining() / 5 {
+            return Err(ValueError::UnrepresentableJson("document field count exceeds input"));
+        }
+        let mut doc = Document::new();
+        for _ in 0..n {
+            let key = cur.str_ref()?;
+            if probed.contains(key) {
+                if cur.bytes.get(cur.pos) == Some(&tag::NULL) {
+                    doc.insert(key.to_owned(), decode_value(&mut cur)?);
+                } else {
+                    skip_value(&mut cur)?;
+                    doc.insert(key.to_owned(), Value::Bool(true));
+                }
+            } else if wanted.contains(key) || key.as_bytes().first() == Some(&1) {
+                doc.insert(key.to_owned(), decode_value(&mut cur)?);
+            } else {
+                skip_value(&mut cur)?;
             }
         }
         if cur.pos != bytes.len() {
@@ -367,6 +417,12 @@ struct Cursor<'a> {
 }
 
 impl Cursor<'_> {
+    /// Bytes not yet consumed — the bound every element count read from
+    /// the input is checked against before anything is sized by it.
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
+    }
+
     fn take(&mut self, n: usize) -> Result<&[u8], ValueError> {
         let end = self
             .pos
@@ -527,7 +583,15 @@ fn decode_value(cur: &mut Cursor<'_>) -> Result<Value, ValueError> {
         tag::TIMESTAMP => Value::Timestamp(cur.i64()?),
         tag::ARRAY => {
             let n = cur.u32()? as usize;
-            let mut items = Vec::with_capacity(n);
+            // Every element is at least its tag byte, so a count past the
+            // bytes left is malformed: refuse it here instead of sizing a
+            // Vec by it (a forged `0xFFFFFFFF` reserved 4G slots before the
+            // first missing element was noticed), and never pre-allocate
+            // more than a modest prefix even for an honest count.
+            if n > cur.remaining() {
+                return Err(ValueError::UnrepresentableJson("array count exceeds input"));
+            }
+            let mut items = Vec::with_capacity(n.min(4096));
             for _ in 0..n {
                 items.push(decode_value(cur)?);
             }
@@ -535,6 +599,10 @@ fn decode_value(cur: &mut Cursor<'_>) -> Result<Value, ValueError> {
         }
         tag::DOCUMENT => {
             let n = cur.u32()? as usize;
+            // A field is at least a 4-byte key length plus a value tag.
+            if n > cur.remaining() / 5 {
+                return Err(ValueError::UnrepresentableJson("document field count exceeds input"));
+            }
             let mut doc = Document::new();
             for _ in 0..n {
                 let key = cur.string()?;
@@ -891,5 +959,69 @@ mod tests {
         assert!(Value::doc_has_reserved(&Value::encode_document(&d)).unwrap());
 
         assert!(Value::doc_has_reserved(&Value::Int(3).encode()).is_err());
+    }
+
+    /// Fuzz `value_codec` (F-4): an Array/Document count is checked against
+    /// the bytes left before anything is sized by it, so a forged
+    /// `0xFFFFFFFF` is a clean decode error, not a 4G-slot reservation —
+    /// and honest counts, large ones included, round-trip as before.
+    #[test]
+    fn forged_element_counts_are_refused_before_allocation() {
+        let forged_array = [9u8, 0xff, 0xff, 0xff, 0xff, 0x00];
+        assert!(Value::decode(&forged_array).is_err());
+        let forged_doc = [10u8, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00];
+        assert!(Value::decode(&forged_doc).is_err());
+        let wanted: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
+        assert!(Value::decode_document_projected(&forged_doc, &wanted).is_err());
+        // Nested: an inner array claiming more than the outer leaves.
+        let mut nested = vec![9u8, 1, 0, 0, 0, 9, 0xff, 0xff, 0xff, 0x7f];
+        nested.extend_from_slice(&[0u8; 8]);
+        assert!(Value::decode(&nested).is_err());
+        let big = Value::Array((0..10_000).map(Value::Int).collect());
+        assert_eq!(Value::decode(&big.encode()).unwrap(), big);
+        let mut d = Document::new();
+        for i in 0..5_000 {
+            d.insert(format!("k{i}"), Value::Null);
+        }
+        let v = Value::Document(d);
+        assert_eq!(Value::decode(&v.encode()).unwrap(), v);
+        let wanted: std::collections::HashSet<String> = ["k7".to_string()].into_iter().collect();
+        assert_eq!(Value::decode_document_projected(&v.encode(), &wanted).unwrap().len(), 1);
+    }
+
+    /// A probed field reads as NULL when it holds NULL and as `true`
+    /// otherwise, its value never decoded; wanted fields decode in full,
+    /// the rest are skipped, a missing probed field stays missing.
+    #[test]
+    fn a_probed_field_answers_its_nullness_only() {
+        let mut d = Document::new();
+        d.insert("emb", Value::Array((0..512).map(|i| Value::Float(i as f64)).collect()));
+        d.insert("gone", Value::Null);
+        d.insert("n", Value::Int(7));
+        d.insert("big", Value::String("x".repeat(4096)));
+        let bytes = Value::Document(d).encode();
+        let set = |names: &[&str]| -> std::collections::HashSet<String> {
+            names.iter().map(|s| s.to_string()).collect()
+        };
+        let got = Value::decode_document_probed(&bytes, &set(&["n"]), &set(&["emb", "gone", "absent"])).unwrap();
+        assert_eq!(got.get("emb"), Some(&Value::Bool(true)));
+        assert_eq!(got.get("gone"), Some(&Value::Null));
+        assert_eq!(got.get("n"), Some(&Value::Int(7)));
+        assert_eq!(got.get("big"), None);
+        assert_eq!(got.get("absent"), None);
+        assert!(Value::decode_document_probed(&bytes[..bytes.len() - 1], &set(&["n"]), &set(&["emb"])).is_err());
+    }
+
+    /// Extreme decimal scales are plain data to the codec (a fixed 16 + 4
+    /// bytes): they round-trip exactly and render without panicking.
+    #[test]
+    fn extreme_decimal_scales_round_trip() {
+        for scale in [70_000u32, u16::MAX as u32 + 1, u32::MAX] {
+            let v = Value::Decimal(Decimal::new(1, scale));
+            let back = Value::decode(&v.encode()).unwrap();
+            assert_eq!(back, v);
+            assert_eq!(back.to_string(), format!("1E-{scale}"));
+            assert!(!back.encode_key().is_empty(), "key encoding is total too");
+        }
     }
 }

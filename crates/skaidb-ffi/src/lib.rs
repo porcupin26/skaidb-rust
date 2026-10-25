@@ -2,8 +2,8 @@
 //!
 //! Every function here is a thin, documented translation of a
 //! [`skaidb::Client`] / [`skaidb::Pool`] call: the wire
-//! protocol, SCRAM/Kerberos, TLS, failover, prepared statements, pipelining
-//! and streaming all live in `skaidb-driver`; this crate owns nothing but
+//! protocol, SCRAM/Kerberos, TLS, failover, prepared statements, pipelining,
+//! streaming and pool balancing all live in `skaidb-driver`; this crate owns nothing but
 //! the boxing, the string conversions and the error channel. The header
 //! (`include/skaidb.h`) is hand-written and is the contract; the C++ RAII
 //! wrapper (`include/skaidb.hpp`) sits on top of it with no protocol code
@@ -30,10 +30,14 @@
 #![allow(non_camel_case_types)]
 
 use std::cell::RefCell;
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{c_char, c_int, CStr, CString};
 use std::ptr;
+use std::time::Duration;
 
-use skaidb::{Client, DriverError, Pool, Prepared, RowStream, TlsConfig, TlsVerify};
+use skaidb::{
+    Client, DriverError, IdleOrder, LoadBalancing, MemberState, Pool, Prepared, RowStream,
+    TlsConfig, TlsVerify,
+};
 use skaidb_proto::{Consistency, Response};
 use skaidb_types::{Decimal, Document, Uuid, Value};
 
@@ -164,6 +168,66 @@ impl std::fmt::Debug for skaidb_stream {
 /// Opaque handle: a connection pool.
 #[derive(Debug)]
 pub struct skaidb_pool(Pool);
+
+/// The header's `skaidb_pool_options_t`. The two enum fields are read as
+/// `int` and checked, so a value outside the C enum is an error, not
+/// undefined behaviour.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct skaidb_pool_options {
+    pub maxsize: usize,
+    pub load_balancing: c_int,
+    pub idle_order: c_int,
+    pub discover: bool,
+    pub refresh_interval_ms: u64,
+    pub read_your_writes_ms: u64,
+    pub eject_errors: u32,
+    pub eject_latency_factor: f64,
+    pub eject_latency_floor_ms: u64,
+    pub eject_backoff_ms: u64,
+    pub eject_backoff_max_ms: u64,
+}
+
+impl Default for skaidb_pool_options {
+    /// The driver's defaults (docs/PROTOCOL.md §6.1), as the header lists them.
+    fn default() -> skaidb_pool_options {
+        skaidb_pool_options {
+            maxsize: 10,
+            load_balancing: 0, // SKAIDB_LB_RANDOM
+            idle_order: 0,     // SKAIDB_IDLE_LIFO
+            discover: false,
+            refresh_interval_ms: 60_000,
+            read_your_writes_ms: 0,
+            eject_errors: 3,
+            eject_latency_factor: 3.0,
+            eject_latency_floor_ms: 50,
+            eject_backoff_ms: 5_000,
+            eject_backoff_max_ms: 60_000,
+        }
+    }
+}
+
+/// The header's `skaidb_member_t`: one member as a balanced pool sees it.
+/// The strings borrow the owning `skaidb_members_t`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct skaidb_member {
+    pub endpoint: *const c_char,
+    pub canonical: *const c_char,
+    pub state: *const c_char,
+    pub latency_ms: f64,
+    pub in_use: usize,
+    pub idle: usize,
+    pub seed: bool,
+}
+
+/// Opaque handle: a pool's members ([`skaidb_pool_members`]). Owns the
+/// strings its items point into.
+#[derive(Debug)]
+pub struct skaidb_members {
+    _strings: Vec<CString>,
+    items: Vec<skaidb_member>,
+}
 
 thread_local! {
     static LAST_ERROR: RefCell<CString> = RefCell::new(CString::default());
@@ -1464,6 +1528,183 @@ pub unsafe extern "C" fn skaidb_pool_free(pool: *mut skaidb_pool) {
     }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn skaidb_pool_options_init(options: *mut skaidb_pool_options) {
+    if !options.is_null() {
+        options.write(skaidb_pool_options::default());
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn skaidb_pool_new_balanced(
+    endpoints: *const *const c_char,
+    n_endpoints: usize,
+    username: *const c_char,
+    password: *const c_char,
+    tls: *const skaidb_tls,
+    database: *const c_char,
+    options: *const skaidb_pool_options,
+    out: *mut *mut skaidb_pool,
+) -> skaidb_status {
+    boxed(out, || {
+        let eps = cstr_list(endpoints, n_endpoints, "endpoints")?;
+        if eps.is_empty() {
+            return Err(fail(SKAIDB_ERR_INVALID, "no endpoints"));
+        }
+        let user = cstr(username, "username")?;
+        let pass = cstr(password, "password")?;
+        let tls = tls_config(tls)?;
+        let db = cstr_opt(database, "database")?;
+        let o = if options.is_null() {
+            skaidb_pool_options::default()
+        } else {
+            *options
+        };
+        let policy = match o.load_balancing {
+            0 => LoadBalancing::Random,
+            1 => LoadBalancing::RoundRobin,
+            2 => LoadBalancing::LeastLatency,
+            other => {
+                return Err(fail(
+                    SKAIDB_ERR_INVALID,
+                    format!("options.load_balancing {other} is not a skaidb_load_balancing_t"),
+                ))
+            }
+        };
+        let idle_order = match o.idle_order {
+            0 => IdleOrder::Lifo,
+            1 => IdleOrder::Fifo,
+            other => {
+                return Err(fail(
+                    SKAIDB_ERR_INVALID,
+                    format!("options.idle_order {other} is not a skaidb_idle_order_t"),
+                ))
+            }
+        };
+        let mut builder = Pool::builder(&eps)
+            .credentials(user, pass)
+            .maxsize(o.maxsize)
+            .load_balancing(policy)
+            .idle_order(idle_order)
+            .discover(o.discover)
+            .refresh_interval(Duration::from_millis(o.refresh_interval_ms))
+            .read_your_writes(Duration::from_millis(o.read_your_writes_ms))
+            .eject_errors(o.eject_errors)
+            .eject_latency_factor(o.eject_latency_factor)
+            .eject_latency_floor(Duration::from_millis(o.eject_latency_floor_ms))
+            .eject_backoff(Duration::from_millis(o.eject_backoff_ms))
+            .eject_backoff_max(Duration::from_millis(o.eject_backoff_max_ms));
+        if let Some(t) = tls {
+            builder = builder.tls(t);
+        }
+        if let Some(d) = db {
+            builder = builder.database(d);
+        }
+        builder.build().map(skaidb_pool).map_err(|e| match &e {
+            // An option out of range is the caller's argument, not I/O.
+            DriverError::Io(io) if io.kind() == std::io::ErrorKind::InvalidInput => {
+                fail(SKAIDB_ERR_INVALID, e.to_string())
+            }
+            _ => fail_driver(e),
+        })
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn skaidb_pool_acquire_affinity(
+    pool: *mut skaidb_pool,
+    affinity: *const c_char,
+    out: *mut *mut skaidb_client,
+) -> skaidb_status {
+    boxed(out, || {
+        if pool.is_null() {
+            return Err(fail(SKAIDB_ERR_INVALID, "pool is NULL"));
+        }
+        let got = match cstr_opt(affinity, "affinity")? {
+            Some(key) => (*pool).0.acquire_with_affinity(key),
+            None => (*pool).0.acquire(),
+        };
+        got.map(skaidb_client).map_err(fail_driver)
+    })
+}
+
+fn member_state_c(state: MemberState) -> &'static CStr {
+    match state {
+        MemberState::Ready => c"ready",
+        MemberState::Ejected => c"ejected",
+        MemberState::Resyncing => c"resyncing",
+        MemberState::Unreachable => c"unreachable",
+        MemberState::Unlisted => c"unlisted",
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn skaidb_pool_members(
+    pool: *const skaidb_pool,
+    out: *mut *mut skaidb_members,
+) -> skaidb_status {
+    boxed(out, || {
+        if pool.is_null() {
+            return Err(fail(SKAIDB_ERR_INVALID, "pool is NULL"));
+        }
+        let mut strings = Vec::new();
+        let mut items = Vec::new();
+        for m in (*pool).0.members() {
+            // A CString's bytes stay put when the CString moves into
+            // `strings`, so the pointers taken here remain valid.
+            let endpoint = c_string_lossy(&m.endpoint);
+            let canonical = m.canonical.as_deref().map(c_string_lossy);
+            items.push(skaidb_member {
+                endpoint: endpoint.as_ptr(),
+                canonical: canonical.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
+                state: member_state_c(m.state).as_ptr(),
+                latency_ms: m.latency.map_or(-1.0, |d| d.as_secs_f64() * 1000.0),
+                in_use: m.in_use,
+                idle: m.idle,
+                seed: m.seed,
+            });
+            strings.push(endpoint);
+            strings.extend(canonical);
+        }
+        Ok(skaidb_members {
+            _strings: strings,
+            items,
+        })
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn skaidb_members_len(members: *const skaidb_members) -> usize {
+    if members.is_null() {
+        0
+    } else {
+        (*members).items.len()
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn skaidb_members_get(
+    members: *const skaidb_members,
+    index: usize,
+) -> *const skaidb_member {
+    if members.is_null() {
+        return ptr::null();
+    }
+    let members = &*members;
+    members
+        .items
+        .get(index)
+        .map_or(ptr::null(), |m| m as *const skaidb_member)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn skaidb_members_free(members: *mut skaidb_members) {
+    if !members.is_null() {
+        drop(Box::from_raw(members));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1484,6 +1725,68 @@ mod tests {
         assert!(parse_decimal("abc").is_none());
         assert!(parse_decimal(".").is_none());
         assert!(parse_decimal("1.2.3").is_none());
+    }
+
+    #[test]
+    fn a_balanced_pool_builds_without_dialing_and_lists_its_seeds() {
+        unsafe {
+            let mut opts = std::mem::MaybeUninit::<skaidb_pool_options>::uninit();
+            skaidb_pool_options_init(opts.as_mut_ptr());
+            let mut opts = opts.assume_init();
+            assert_eq!((opts.maxsize, opts.eject_errors, opts.refresh_interval_ms), (10, 3, 60_000));
+            opts.load_balancing = 1;
+            let eps = [c"127.0.0.1:1".as_ptr(), c"127.0.0.1:2".as_ptr()];
+            let mut pool = ptr::null_mut();
+            let s = skaidb_pool_new_balanced(
+                eps.as_ptr(),
+                2,
+                c"u".as_ptr(),
+                c"p".as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                &opts,
+                &mut pool,
+            );
+            assert_eq!(s, SKAIDB_OK);
+            let mut members = ptr::null_mut();
+            assert_eq!(skaidb_pool_members(pool, &mut members), SKAIDB_OK);
+            assert_eq!(skaidb_members_len(members), 2);
+            let m = &*skaidb_members_get(members, 1);
+            assert_eq!(CStr::from_ptr(m.endpoint).to_str().unwrap(), "127.0.0.1:2");
+            assert_eq!(CStr::from_ptr(m.state).to_str().unwrap(), "ready");
+            assert!(m.canonical.is_null() && m.seed && m.latency_ms < 0.0);
+            assert!(skaidb_members_get(members, 2).is_null());
+            skaidb_members_free(members);
+            skaidb_pool_free(pool);
+            // An enum value outside the C enum is refused, not trusted.
+            opts.load_balancing = 7;
+            let mut bad = ptr::null_mut();
+            let s = skaidb_pool_new_balanced(
+                eps.as_ptr(),
+                2,
+                c"u".as_ptr(),
+                c"p".as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                &opts,
+                &mut bad,
+            );
+            assert_eq!(s, SKAIDB_ERR_INVALID);
+            assert!(bad.is_null());
+            opts.load_balancing = 0;
+            opts.eject_errors = 0;
+            let s = skaidb_pool_new_balanced(
+                eps.as_ptr(),
+                2,
+                c"u".as_ptr(),
+                c"p".as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                &opts,
+                &mut bad,
+            );
+            assert_eq!(s, SKAIDB_ERR_INVALID);
+        }
     }
 
     #[test]

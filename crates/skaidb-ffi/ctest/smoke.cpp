@@ -1,7 +1,7 @@
 // libskaidb C++ smoke test: the RAII layer over the same ground the C test
 // covers — connect, DDL, prepared statements with typed parameters, a
 // batch, range-for over results and streams, a pipeline with an inline
-// error, values, and the pool. Run by ctest/run.sh.
+// error, values, and the pools (plain and balanced). Run by ctest/run.sh.
 #include "skaidb.hpp"
 
 #include <cstdlib>
@@ -139,6 +139,35 @@ int main() {
     ASSERT(pool.with([](skaidb::Client &cl) {
         return cl.execute("SELECT count(*) FROM cppffi_smoke")[0][0].as_int();
     }) == 4);
+    ASSERT(pool.members().empty());
+
+    // The balanced pool against one standalone server: discovery finds no
+    // other member (SHOW ENDPOINTS answers no rows) and keeps the seed.
+    skaidb::PoolOptions opts;
+    opts.maxsize = 2;
+    opts.load_balancing = skaidb::LoadBalancing::LeastLatency;
+    opts.discover = true;
+    opts.read_your_writes = std::chrono::seconds(2);
+    auto balanced = skaidb::Pool::balanced({endpoint}, user, password, opts);
+    ASSERT(balanced.with("alice", [](skaidb::Client &cl) {
+        return cl.execute("UPDATE cppffi_smoke SET name = 'four' WHERE id = 4").kind();
+    }) == skaidb::Kind::Mutation);
+    {
+        auto lease = balanced.acquire("alice");
+        ASSERT(lease->execute("SELECT count(*) FROM cppffi_smoke")[0][0].as_int() == 4);
+        auto ms = balanced.members();
+        ASSERT(ms.size() == 1 && ms[0].endpoint == endpoint && ms[0].seed && !ms[0].canonical);
+        ASSERT(ms[0].state == "ready" && ms[0].in_use == 1 && ms[0].latency_ms && *ms[0].latency_ms >= 0);
+    }
+    ASSERT(balanced.idle_len() == 1 && balanced.members()[0].idle == 1);
+    try {
+        skaidb::PoolOptions bad;
+        bad.eject_errors = 0;
+        skaidb::Pool::balanced({endpoint}, user, password, bad);
+        ASSERT(false);
+    } catch (const skaidb::Error &e) {
+        ASSERT(e.status() == SKAIDB_ERR_INVALID);
+    }
 
     c.execute("DROP TABLE cppffi_smoke");
     std::cout << "C++ smoke: OK (libskaidb " << skaidb::version() << ")\n";

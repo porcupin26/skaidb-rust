@@ -3,7 +3,8 @@
  * A C ABI over the reference Rust driver (crates/skaidb-driver): the same
  * binary protocol, SCRAM-SHA-256 or Kerberos authentication, TLS, nearest-
  * node selection and failover, prepared statements with typed parameters,
- * pipelining, streamed result sets and a connection pool.
+ * pipelining, streamed result sets and a connection pool that balances
+ * across the cluster's members.
  *
  * Conventions
  *   - Every fallible call returns a skaidb_status_t. On any status other
@@ -277,15 +278,107 @@ char *skaidb_value_to_json_dup(const skaidb_value_t *v);
 
 /* Connections are built from these settings on demand; `maxsize` bounds the
  * connections kept IDLE (a burst opens extras and drops the surplus on
- * release). `database` may be NULL. Thread-safe. */
+ * release). `database` may be NULL. Thread-safe. The most recently released
+ * connection is handed out first; for a pool balanced across the members,
+ * use skaidb_pool_new_balanced. */
 skaidb_pool_t *skaidb_pool_new(size_t maxsize, const char *const *endpoints, size_t n_endpoints,
                                const char *username, const char *password,
                                const skaidb_tls_t *tls, const char *database);
 skaidb_status_t skaidb_pool_acquire(skaidb_pool_t *pool, skaidb_client_t **out);
+/* A balanced pool drops a connection a transport error broke, or whose
+ * member is ejected, not ready or gone, instead of keeping it idle. */
 void skaidb_pool_release(skaidb_pool_t *pool, skaidb_client_t *client);
 size_t skaidb_pool_idle_len(const skaidb_pool_t *pool);
-/* Drops every idle connection and makes acquire fail; frees the pool. */
+/* Drops every idle connection and makes acquire fail; stops a balanced
+ * pool's background thread; frees the pool. */
 void skaidb_pool_free(skaidb_pool_t *pool);
+
+/* -- balancing across members (docs/PROTOCOL.md 6.1,
+ *    https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members) */
+
+typedef enum skaidb_load_balancing {
+    SKAIDB_LB_RANDOM = 0,        /* any idle connection; a new one dials the usable members in
+                                    random order and sticks to the member it reached */
+    SKAIDB_LB_ROUND_ROBIN = 1,   /* the next usable member in endpoint order */
+    SKAIDB_LB_LEAST_LATENCY = 2  /* of two usable members picked at random, the lower latency
+                                    average x (checked-out connections + 1); a member not
+                                    measured in the last 2 s scores 0, so it is tried */
+} skaidb_load_balancing_t;
+
+typedef enum skaidb_idle_order {
+    SKAIDB_IDLE_LIFO = 0,  /* the most recently released idle connection first */
+    SKAIDB_IDLE_FIFO = 1   /* the longest idle first: every idle connection keeps being used */
+} skaidb_idle_order_t;
+
+/* Options of a balanced pool. Fill with skaidb_pool_options_init (the
+ * defaults are in parentheses), then change what you need. */
+typedef struct skaidb_pool_options {
+    size_t maxsize;                         /* idle connections kept (10; >= 1) */
+    skaidb_load_balancing_t load_balancing; /* (SKAIDB_LB_RANDOM) */
+    skaidb_idle_order_t idle_order;         /* (SKAIDB_IDLE_LIFO) */
+    bool discover;                          /* learn the members from SHOW ENDPOINTS (false):
+                                               joiners are added, leavers dropped (a seed is
+                                               kept, "unlisted"), resyncing/unreachable members
+                                               get no new connections; a standalone or older
+                                               server keeps the seeds and stops discovery */
+    uint64_t refresh_interval_ms;           /* re-read the members this often (60000; 5000 at
+                                               most while one is resyncing/unreachable) */
+    uint64_t read_your_writes_ms;           /* after a write, checkouts under the same affinity
+                                               key go to the member that took it (0 = off) */
+    uint32_t eject_errors;                  /* consecutive transport failures that eject a
+                                               member (3; >= 1) */
+    double eject_latency_factor;            /* eject a member whose latency average is above
+                                               this x the other members' median (3.0; 0 = off) */
+    uint64_t eject_latency_floor_ms;        /* ... and more than this above it (50) */
+    uint64_t eject_backoff_ms;              /* an ejection lasts this long, doubled per repeat,
+                                               then a background probe re-admits (5000) */
+    uint64_t eject_backoff_max_ms;          /* the longest ejection (60000) */
+} skaidb_pool_options_t;
+
+void skaidb_pool_options_init(skaidb_pool_options_t *options);
+
+/* A pool that knows the endpoints (the seeds) and balances its connections
+ * across the members. `tls`, `database` and `options` may be NULL (NULL
+ * options = the defaults). Nothing is dialed until the first acquire. An
+ * option out of range is SKAIDB_ERR_INVALID. The last usable member is
+ * never ejected. */
+skaidb_status_t skaidb_pool_new_balanced(const char *const *endpoints, size_t n_endpoints,
+                                         const char *username, const char *password,
+                                         const skaidb_tls_t *tls, const char *database,
+                                         const skaidb_pool_options_t *options,
+                                         skaidb_pool_t **out);
+
+/* skaidb_pool_acquire under an affinity key (a user id, a session id) for
+ * read_your_writes_ms; NULL = the pool-wide key that skaidb_pool_acquire
+ * uses. A pool from skaidb_pool_new ignores the key. Derive the key without
+ * querying through the same pool: take the raw id from the session or
+ * token — computing it from something that itself reads the database (a
+ * framework's "current user" loader) after checking out acquires again from
+ * inside the checkout. */
+skaidb_status_t skaidb_pool_acquire_affinity(skaidb_pool_t *pool, const char *affinity,
+                                             skaidb_client_t **out);
+
+/* One member as a balanced pool sees it. Strings borrow the
+ * skaidb_members_t and are valid until skaidb_members_free. */
+typedef struct skaidb_member {
+    const char *endpoint;   /* what the pool dials */
+    const char *canonical;  /* the member's own SHOW ENDPOINTS name; NULL until discovered */
+    const char *state;      /* "ready", "ejected", "resyncing", "unreachable" or "unlisted" */
+    double latency_ms;      /* round-trip average; negative until measured */
+    size_t in_use;          /* connections checked out */
+    size_t idle;            /* idle connections */
+    bool seed;              /* a configured endpoint (never dropped) */
+} skaidb_member_t;
+
+typedef struct skaidb_members skaidb_members_t;
+
+/* A snapshot of the members, in endpoint order (none for a pool from
+ * skaidb_pool_new, which knows no members). */
+skaidb_status_t skaidb_pool_members(const skaidb_pool_t *pool, skaidb_members_t **out);
+size_t skaidb_members_len(const skaidb_members_t *members);
+/* NULL when out of range. */
+const skaidb_member_t *skaidb_members_get(const skaidb_members_t *members, size_t index);
+void skaidb_members_free(skaidb_members_t *members);
 
 #ifdef __cplusplus
 }

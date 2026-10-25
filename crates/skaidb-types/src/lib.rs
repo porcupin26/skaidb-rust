@@ -7,6 +7,7 @@
 
 mod codec;
 pub mod diskfull;
+pub mod dir_size;
 mod json;
 pub mod slog;
 pub mod ternary;
@@ -33,4 +34,7 @@ mod value;
 
 pub use slog::{init_server_log, log_timestamp, log_timestamp_into, push_u64, server_log};
 pub use ternary::Ternary;
-pub use value::{encoded_array_prefix, Decimal, Document, Uuid, Value, ValueError, ValueType};
+pub use value::{
+    cmp_i64_f64, decode_numeric_key, encoded_array_prefix, i64_is_exact_f64, key_tag, Decimal,
+    Document, Uuid, Value, ValueError, ValueType,
+};

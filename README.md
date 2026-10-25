@@ -3,9 +3,9 @@
 The native, synchronous Rust client for [skaidb](https://skaidb.org). It
 speaks the binary fast-path protocol directly — SCRAM-SHA-256 or Kerberos
 authentication, optional TLS, prepared statements with bound parameters,
-pipelined batches, streamed result sets and a connection pool — and it is
-the reference implementation of the
-[wire protocol](https://skaidb.org/docs/PROTOCOL.html) that every other
+pipelined batches, streamed result sets and a connection pool that balances
+across the cluster's members — and it is the reference implementation of
+the [wire protocol](https://skaidb.org/docs/PROTOCOL.html) that every other
 official driver follows.
 
 - Wire protocol specification: <https://skaidb.org/docs/PROTOCOL.html>
@@ -23,7 +23,7 @@ is tested with:
 
 ```toml
 [dependencies]
-skaidb = "0.308"
+skaidb = "0.328"
 ```
 
 Kerberos (GSSAPI) logins are behind the `kerberos` feature, which links the
@@ -32,7 +32,7 @@ MIT krb5 library through `cross-krb5`. Install the development headers first
 macOS and Windows) and enable the feature:
 
 ```toml
-skaidb = { version = "0.308", features = ["kerberos"] }
+skaidb = { version = "0.328", features = ["kerberos"] }
 ```
 
 The feature is off by default and never builds on static musl targets.
@@ -148,7 +148,9 @@ statement can run twice if the node died after applying it but before
 answering. `reconnect()` does the same on demand, for a pool or a caller
 with its own retry policy. Prepared statements do not survive a reconnect;
 see [Prepared statements](#prepared-statements) for how the driver hides
-that.
+that. A connection from a [balanced pool](#a-pool-balanced-across-members)
+re-dials in the pool's order instead — usable members first (random
+order), the member it just lost last.
 
 ### TLS modes
 
@@ -406,26 +408,162 @@ session to node defaults. The budget is tightening-only server-side.
 pub struct Pool { /* … */ }
 
 impl Pool {
-    pub fn new<F>(maxsize: usize, make: F) -> Pool
+    pub fn builder<S: AsRef<str>>(endpoints: &[S]) -> PoolBuilder;  // balanced across members
+    pub fn new<F>(maxsize: usize, make: F) -> Pool                   // connections from a closure
         where F: Fn() -> Result<Client, DriverError> + Send + Sync + 'static;
     pub fn acquire(&self) -> Result<Client, DriverError>;
+    pub fn acquire_with_affinity(&self, affinity: &str) -> Result<Client, DriverError>;
     pub fn release(&self, client: Client);
     pub fn with<T, F>(&self, work: F) -> Result<T, DriverError>
         where F: FnOnce(&mut Client) -> Result<T, DriverError>;
+    pub fn with_affinity<T, F>(&self, affinity: &str, work: F) -> Result<T, DriverError>
+        where F: FnOnce(&mut Client) -> Result<T, DriverError>;
     pub fn idle_len(&self) -> usize;
+    pub fn members(&self) -> Vec<PoolMember>;
     pub fn close(&self);
 }
 ```
 
-`Pool` is `Send + Sync`; share it behind an `Arc`. Connections are built
-by the closure, so they inherit whatever it configures — seeds, TLS,
-credentials, session database. `maxsize` bounds the connections kept
-**idle**, not the number checked out: a burst opens extras and the surplus
-is dropped on return, so callers never block waiting for a slot. Idle
-connections are handed out as-is; a connection the server closed while it
-sat idle re-dials itself on first use, so no liveness probe is needed.
-`close` drops every idle connection and makes `acquire` fail; connections
-checked out at the time are dropped when returned. `new` panics if
+`Pool` is `Send + Sync`; share it behind an `Arc`. `maxsize` bounds the
+connections kept **idle**, not the number checked out: a burst opens extras
+and the surplus is dropped on return, so callers never block waiting for a
+slot. Idle connections are handed out as-is; a connection the server closed
+while it sat idle re-dials itself on first use, so no liveness probe is
+needed. `close` (and dropping the pool) drops every idle connection and
+makes `acquire` fail; connections checked out at the time are dropped when
+returned.
+
+### A pool balanced across members
+
+`Pool::builder` knows the endpoints (the seeds) and how to log in, and
+spreads its connections across the cluster's members by the rules every
+official driver shares —
+[PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members).
+Nothing is dialed until the first checkout.
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+use skaidb::{LoadBalancing, Pool};
+
+let pool = Arc::new(
+    Pool::builder(&["db1:7000", "db2:7000", "db3:7000"])
+        .credentials("app", "secret")
+        .database("app")
+        .maxsize(8)
+        .load_balancing(LoadBalancing::LeastLatency)
+        .discover(true)
+        .read_your_writes(Duration::from_secs(2))
+        .build()?,
+);
+let n = pool.with(|c| c.execute("SELECT count(*) FROM t"))?;
+pool.with_affinity("user-42", |c| c.execute("UPDATE carts SET n = 3 WHERE id = 42"))?;
+let cart = pool.with_affinity("user-42", |c| c.execute("SELECT n FROM carts WHERE id = 42"))?;
+```
+
+| Builder method | Default | Meaning |
+|---|---|---|
+| `credentials(user, password)` / `gssapi(principal, spn)` / `certificate(user)` | anonymous | how every connection logs in (as `connect_many_tls`, `connect_gssapi_tls`, `connect_certificate`) |
+| `tls(TlsConfig)` | plaintext | TLS for every connection |
+| `database(name)` | none | session database, re-applied after every reconnect |
+| `consistency(Consistency)` | `Quorum` | default consistency of every connection |
+| `maxsize(n)` | 10 | idle connections kept (at least 1) |
+| `load_balancing(LoadBalancing)` | `Random` | `Random`: any idle connection, a new one dials the usable members in random order and sticks to the member it reached. `RoundRobin`: the next usable member in endpoint order. `LeastLatency`: of two usable members picked at random, the one with the lower latency average × (checked-out connections + 1); a member not measured yet, or not in the last 2 s, scores 0, so it is tried |
+| `idle_order(IdleOrder)` | `Lifo` | `Lifo`: the most recently returned idle connection first (a quiet pool keeps few sockets warm). `Fifo`: the longest idle first (every idle connection keeps being used, so a server-side idle timeout never finds one) |
+| `discover(bool)` | off | learn the members from `SHOW ENDPOINTS` (server ≥ 0.327) |
+| `refresh_interval(Duration)` | 60 s | how often discovery re-reads the members (every 5 s while one is `resyncing` or `unreachable`) |
+| `read_your_writes(Duration)` | zero (off) | after a write, checkouts under the same affinity key go to the member that took it for this long |
+| `eject_errors(n)` | 3 | consecutive transport failures that eject a member (at least 1) |
+| `eject_latency_factor(f64)` | 3.0 | eject a member whose latency average is above this × the other members' median (0 disables) |
+| `eject_latency_floor(Duration)` | 50 ms | … and more than this above it |
+| `eject_backoff(Duration)` | 5 s | how long an ejection lasts, doubled for each repeat |
+| `eject_backoff_max(Duration)` | 60 s | the longest ejection; a member healthy this long after a re-admission starts over at the base |
+
+`build()` fails with `NoEndpoint` without endpoints and with an
+`InvalidInput` I/O error for an option out of range. `LoadBalancing` and
+`IdleOrder` also parse from their names (`"random"`, `"round_robin"`,
+`"least_latency"`, `"lifo"`, `"fifo"`) with `str::parse`, for
+configuration files.
+
+**Targeting a member.** With a target the pool hands out an idle connection
+to it, or dials it; a failed dial falls through to the other usable members
+(random order), then to the unusable ones (`resyncing`/`unreachable` before
+ejected, the soonest re-admission first). An idle connection to a member
+that is no longer usable is closed rather than handed out, and one returned
+to the pool is closed instead of kept — as is one a transport error left
+broken.
+
+**Latency.** Per member the pool keeps an exponentially weighted average of
+round trips (request sent to first response frame): each sample moves it
+5 % of the way, no sample counts for more than 10 × the larger of the
+average and the ejection floor, and the first sample sets it. One slow
+statement barely moves it; a member that stays slow converges within a few
+dozen statements.
+
+**Health ejection.** A member is ejected — no new connections, its idle ones
+closed — after `eject_errors` consecutive transport failures (a failed
+dial, an I/O error mid-request, a capacity refusal; a statement error or a
+login refused for its credentials is no member failure), or when, with at
+least 10 samples on it and on another usable member, its average is above
+`eject_latency_factor` × the median of the other usable members' averages
+and more than `eject_latency_floor` above it. When the backoff is up, a
+background thread dials the member alone and runs one statement: success
+re-admits it with a fresh average and errors cleared (the probe connection
+joins the idle set), failure ejects it again for twice as long. The thread
+holds the pool weakly, never keeps the process alive, and exits when the
+pool is closed or dropped. **The last usable member is never ejected** — a
+slow or flaky member beats none.
+
+**Discovery.** With `discover(true)` the pool runs `SHOW ENDPOINTS` on the
+first connection it makes to each member whose name it has not learned yet
+— the answering member's `local` row names it, so a seed given as a host
+name is matched to the endpoint the server reports and never counted
+twice — and every `refresh_interval` after that. A listed endpoint the pool
+does not know becomes a member; a discovered member missing from a later
+listing is dropped; a seed is never dropped (its member leaving the ring
+marks it `Unlisted`). Only `ready` members get new connections, and a
+member that becomes `ready` again starts with a fresh average. A
+standalone server answers no rows and a server older than the statement an
+error: either way the pool keeps its seeds and stops asking.
+
+**Read-your-writes.** The member that coordinated a write reads it back at
+any consistency, `ONE` included. With a window set, after a write succeeds
+on a connection checked out under an affinity key (`acquire_with_affinity`,
+`with_affinity` — a user id, a session id), checkouts under the same key go
+to that member until the window ends, unless it is ejected or not `ready`.
+Checkouts without a key share one pool-wide key. A statement counts as a
+write unless its first keyword (after whitespace, comments and opening
+parentheses) is `SELECT`, `SHOW`, `EXPLAIN`, `DESCRIBE`, `DESC`, `VALUES`,
+`WITH` or `USE`. Derive the key without querying through the same pool: a
+helper that checks out a connection and only then computes the key from
+something that itself reads the database (a web framework's "current user"
+loader) checks out again from inside its own checkout. Take the raw id from
+the session or token instead.
+
+**Introspection.** `members()` lists each member in endpoint order:
+
+```rust
+pub struct PoolMember {
+    pub endpoint: String,           // what the pool dials
+    pub canonical: Option<String>,  // its own SHOW ENDPOINTS name, once discovered
+    pub state: MemberState,         // Ready, Ejected, Resyncing, Unreachable, Unlisted
+    pub latency: Option<Duration>,  // the round-trip average, once measured
+    pub in_use: usize,              // connections checked out
+    pub idle: usize,                // idle connections
+    pub seed: bool,                 // a configured endpoint
+}
+```
+
+`MemberState::as_str()` gives the spec's names (`ready`, `ejected`,
+`resyncing`, `unreachable`, `unlisted`).
+
+### A pool from a closure
+
+`Pool::new` builds connections with the closure you supply, so they inherit
+whatever it configures — seeds, TLS, credentials, session database. It
+knows nothing about members: the most recently returned idle connection
+goes out first, `members()` is empty, and the affinity key of
+`acquire_with_affinity` / `with_affinity` is ignored. `new` panics if
 `maxsize` is 0.
 
 ```rust

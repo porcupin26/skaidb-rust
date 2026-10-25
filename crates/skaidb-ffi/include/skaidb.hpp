@@ -23,6 +23,7 @@
 
 #include "skaidb.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
@@ -167,6 +168,13 @@ struct StreamDeleter {
 struct PoolDeleter {
     void operator()(skaidb_pool_t *p) const noexcept { skaidb_pool_free(p); }
 };
+struct MembersDeleter {
+    void operator()(skaidb_members_t *p) const noexcept { skaidb_members_free(p); }
+};
+
+inline std::uint64_t millis(std::chrono::milliseconds d) noexcept {
+    return d.count() > 0 ? static_cast<std::uint64_t>(d.count()) : 0;
+}
 
 }  // namespace detail
 
@@ -701,8 +709,49 @@ private:
     std::unique_ptr<skaidb_client_t, detail::ClientDeleter> p_;
 };
 
+/* How a balanced Pool picks the member for a checkout. */
+enum class LoadBalancing : int {
+    Random = SKAIDB_LB_RANDOM,            // any idle connection; new ones dial members in random order
+    RoundRobin = SKAIDB_LB_ROUND_ROBIN,   // the next usable member in endpoint order
+    LeastLatency = SKAIDB_LB_LEAST_LATENCY,  // of two random members, the lower latency x (in use + 1)
+};
+
+/* Which idle connection a balanced Pool hands out first. */
+enum class IdleOrder : int {
+    Lifo = SKAIDB_IDLE_LIFO,  // the most recently returned
+    Fifo = SKAIDB_IDLE_FIFO,  // the longest idle
+};
+
+/* Options of Pool::balanced (docs/PROTOCOL.md 6.1); the defaults are the
+ * library's (skaidb_pool_options_t documents each). */
+struct PoolOptions {
+    std::size_t maxsize = 10;
+    LoadBalancing load_balancing = LoadBalancing::Random;
+    IdleOrder idle_order = IdleOrder::Lifo;
+    bool discover = false;
+    std::chrono::milliseconds refresh_interval{60000};
+    std::chrono::milliseconds read_your_writes{0};  // 0 = off
+    std::uint32_t eject_errors = 3;
+    double eject_latency_factor = 3.0;  // 0 = no latency ejection
+    std::chrono::milliseconds eject_latency_floor{50};
+    std::chrono::milliseconds eject_backoff{5000};
+    std::chrono::milliseconds eject_backoff_max{60000};
+};
+
+/* One member as a balanced Pool sees it (Pool::members()). */
+struct PoolMember {
+    std::string endpoint;                  // what the pool dials
+    std::optional<std::string> canonical;  // its own SHOW ENDPOINTS name, once discovered
+    std::string state;                     // ready, ejected, resyncing, unreachable, unlisted
+    std::optional<double> latency_ms;      // round-trip average, once measured
+    std::size_t in_use = 0;
+    std::size_t idle = 0;
+    bool seed = false;                     // a configured endpoint
+};
+
 /* A thread-safe pool of connections with the same settings; `maxsize` is
- * how many idle connections it keeps. */
+ * how many idle connections it keeps. Pool::balanced builds one that
+ * spreads its connections across the cluster's members. */
 class Pool {
 public:
     Pool(std::size_t maxsize, const std::vector<std::string> &endpoints, const std::string &username,
@@ -712,6 +761,35 @@ public:
         detail::TlsRaw t(tls);
         p_.reset(detail::checked(skaidb_pool_new(maxsize, eps.data(), eps.size(), username.c_str(),
                                                  password.c_str(), t.ptr, database ? database->c_str() : nullptr)));
+    }
+
+    /* A pool balanced across the members reachable from `endpoints` (the
+     * seeds): policies, health ejection with a background re-probe, member
+     * discovery and read-your-writes affinity. Nothing is dialed until the
+     * first acquire. */
+    static Pool balanced(const std::vector<std::string> &endpoints, const std::string &username,
+                         const std::string &password, const PoolOptions &options = PoolOptions(),
+                         const std::optional<Tls> &tls = std::nullopt,
+                         const std::optional<std::string> &database = std::nullopt) {
+        auto eps = detail::c_strings(endpoints);
+        detail::TlsRaw t(tls);
+        skaidb_pool_options_t o;
+        skaidb_pool_options_init(&o);
+        o.maxsize = options.maxsize;
+        o.load_balancing = static_cast<skaidb_load_balancing_t>(options.load_balancing);
+        o.idle_order = static_cast<skaidb_idle_order_t>(options.idle_order);
+        o.discover = options.discover;
+        o.refresh_interval_ms = detail::millis(options.refresh_interval);
+        o.read_your_writes_ms = detail::millis(options.read_your_writes);
+        o.eject_errors = options.eject_errors;
+        o.eject_latency_factor = options.eject_latency_factor;
+        o.eject_latency_floor_ms = detail::millis(options.eject_latency_floor);
+        o.eject_backoff_ms = detail::millis(options.eject_backoff);
+        o.eject_backoff_max_ms = detail::millis(options.eject_backoff_max);
+        skaidb_pool_t *p = nullptr;
+        detail::check(skaidb_pool_new_balanced(eps.data(), eps.size(), username.c_str(), password.c_str(), t.ptr,
+                                               database ? database->c_str() : nullptr, &o, &p));
+        return Pool(p);
     }
 
     /* A connection on loan: returned to the pool when the Lease dies. */
@@ -752,15 +830,55 @@ public:
         detail::check(skaidb_pool_acquire(p_.get(), &c));
         return Lease(p_.get(), c);
     }
+    /* acquire() under an affinity key (a user id, a session id): with
+     * read_your_writes set, checkouts under a key go to the member that took
+     * its last write until the window ends. Take the key's raw id from the
+     * session or token, not from a lookup through this same pool (that
+     * acquires again from inside the checkout). */
+    Lease acquire(const std::string &affinity) {
+        skaidb_client_t *c = nullptr;
+        detail::check(skaidb_pool_acquire_affinity(p_.get(), affinity.c_str(), &c));
+        return Lease(p_.get(), c);
+    }
     /* Run `f(Client&)` on a pooled connection and return its result. */
     template <class F>
     auto with(F &&f) -> decltype(f(std::declval<Client &>())) {
         Lease lease = acquire();
         return f(lease.client());
     }
+    /* with(f) under an affinity key. */
+    template <class F>
+    auto with(const std::string &affinity, F &&f) -> decltype(f(std::declval<Client &>())) {
+        Lease lease = acquire(affinity);
+        return f(lease.client());
+    }
     std::size_t idle_len() const noexcept { return skaidb_pool_idle_len(p_.get()); }
+    /* The members as a balanced pool sees them, in endpoint order (empty for
+     * a pool built with the plain constructor). */
+    std::vector<PoolMember> members() const {
+        skaidb_members_t *raw = nullptr;
+        detail::check(skaidb_pool_members(p_.get(), &raw));
+        std::unique_ptr<skaidb_members_t, detail::MembersDeleter> owned(raw);
+        std::vector<PoolMember> out;
+        const std::size_t n = skaidb_members_len(raw);
+        out.reserve(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            const skaidb_member_t *m = skaidb_members_get(raw, i);
+            PoolMember pm;
+            pm.endpoint = m->endpoint;
+            if (m->canonical) pm.canonical = std::string(m->canonical);
+            pm.state = m->state;
+            if (m->latency_ms >= 0) pm.latency_ms = m->latency_ms;
+            pm.in_use = m->in_use;
+            pm.idle = m->idle;
+            pm.seed = m->seed;
+            out.push_back(std::move(pm));
+        }
+        return out;
+    }
 
 private:
+    explicit Pool(skaidb_pool_t *p) : p_(p) {}
     std::unique_ptr<skaidb_pool_t, detail::PoolDeleter> p_;
 };
 

@@ -1,7 +1,7 @@
 /* libskaidb C smoke test: connect, DDL, typed parameters through a prepared
  * statement, a batch, a read-back with every value accessor, a pipeline
  * with an inline error, a streamed result (and an abandoned one), values
- * on their own, and the pool. Run by ctest/run.sh. */
+ * on their own, and the pools (plain and balanced). Run by ctest/run.sh. */
 #include "skaidb.h"
 
 #include <inttypes.h>
@@ -223,7 +223,58 @@ int main(void) {
     skaidb_result_free(r);
     skaidb_pool_release(pool, pc);
     ASSERT(skaidb_pool_idle_len(pool) == 1);
+    skaidb_members_t *none = NULL;
+    CHECK(skaidb_pool_members(pool, &none));
+    ASSERT(skaidb_members_len(none) == 0); /* a plain pool knows no members */
+    skaidb_members_free(none);
     skaidb_pool_free(pool);
+
+    /* The balanced pool, against one standalone server: SHOW ENDPOINTS
+     * answers no rows there, so discovery keeps the seed and stops. */
+    skaidb_pool_options_t opts;
+    skaidb_pool_options_init(&opts);
+    ASSERT(opts.maxsize == 10 && opts.eject_errors == 3 && opts.load_balancing == SKAIDB_LB_RANDOM);
+    ASSERT(opts.idle_order == SKAIDB_IDLE_LIFO && opts.refresh_interval_ms == 60000 && !opts.discover);
+    ASSERT(opts.read_your_writes_ms == 0 && opts.eject_latency_factor == 3.0 && opts.eject_latency_floor_ms == 50);
+    ASSERT(opts.eject_backoff_ms == 5000 && opts.eject_backoff_max_ms == 60000);
+    opts.maxsize = 2;
+    opts.load_balancing = SKAIDB_LB_ROUND_ROBIN;
+    opts.idle_order = SKAIDB_IDLE_FIFO;
+    opts.discover = true;
+    opts.read_your_writes_ms = 2000;
+    skaidb_pool_t *bpool = NULL;
+    CHECK(skaidb_pool_new_balanced(eps, 1, user, password, NULL, NULL, &opts, &bpool));
+    CHECK(skaidb_pool_acquire_affinity(bpool, "alice", &pc));
+    CHECK(skaidb_execute(pc, "UPDATE cffi_smoke SET name = 'four' WHERE id = 4", &r));
+    skaidb_result_free(r);
+    skaidb_members_t *ms = NULL;
+    CHECK(skaidb_pool_members(bpool, &ms));
+    ASSERT(skaidb_members_len(ms) == 1);
+    const skaidb_member_t *m = skaidb_members_get(ms, 0);
+    ASSERT(m && strcmp(m->endpoint, endpoint) == 0 && m->seed && m->canonical == NULL);
+    ASSERT(strcmp(m->state, "ready") == 0 && m->in_use == 1 && m->idle == 0 && m->latency_ms >= 0);
+    ASSERT(skaidb_members_get(ms, 1) == NULL);
+    skaidb_members_free(ms);
+    skaidb_pool_release(bpool, pc);
+    CHECK(skaidb_pool_acquire_affinity(bpool, "alice", &pc)); /* the writer's member: the seed */
+    CHECK(skaidb_execute(pc, "SELECT count(*) FROM cffi_smoke", &r));
+    ASSERT(skaidb_value_get_int(skaidb_result_cell(r, 0, 0)) == 4);
+    skaidb_result_free(r);
+    skaidb_pool_release(bpool, pc);
+    CHECK(skaidb_pool_acquire(bpool, &pc));
+    skaidb_pool_release(bpool, pc);
+    CHECK(skaidb_pool_members(bpool, &ms));
+    m = skaidb_members_get(ms, 0);
+    ASSERT(skaidb_members_len(ms) == 1 && m->in_use == 0 && m->idle == 1);
+    skaidb_members_free(ms);
+    ASSERT(skaidb_pool_idle_len(bpool) == 1);
+    skaidb_pool_free(bpool);
+    /* Options out of range are refused. */
+    opts.load_balancing = (skaidb_load_balancing_t)7;
+    ASSERT(skaidb_pool_new_balanced(eps, 1, user, password, NULL, NULL, &opts, &bpool) == SKAIDB_ERR_INVALID);
+    skaidb_pool_options_init(&opts);
+    opts.maxsize = 0;
+    ASSERT(skaidb_pool_new_balanced(eps, 1, user, password, NULL, NULL, &opts, &bpool) == SKAIDB_ERR_INVALID);
 
     CHECK(skaidb_execute(c, "DROP TABLE cffi_smoke", &r));
     skaidb_result_free(r);

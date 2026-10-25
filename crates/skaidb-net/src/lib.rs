@@ -88,6 +88,16 @@ impl Stream {
         }
     }
 
+    /// The underlying TCP socket (under TLS: the one carrying ciphertext) —
+    /// for socket-level waits such as a readiness `peek`, never for reads.
+    pub fn tcp(&self) -> &TcpStream {
+        match self {
+            Stream::Plain(s) => s,
+            Stream::ClientTls(s) => s.get_ref(),
+            Stream::ServerTls(s) => s.get_ref(),
+        }
+    }
+
     /// Set (or with `None` clear) the read timeout on the underlying socket.
     ///
     /// Callers use this to bound a phase rather than a connection — arm it
@@ -365,10 +375,19 @@ pub fn server_config_mtls(
     let verifier = rustls::server::WebPkiClientVerifier::builder(roots)
         .build()
         .map_err(|e| format!("build client-cert verifier: {e}"))?;
-    let cfg = ServerConfig::builder()
+    let mut cfg = ServerConfig::builder()
         .with_client_cert_verifier(verifier)
         .with_single_cert(certs, key)
         .map_err(|e| format!("server mTLS config: {e}"))?;
+    // No TLS 1.3 session tickets: the server sends them right after the
+    // client's Finished, and the client never reads them during the
+    // handshake, so on a freshly dialled connection a readiness check
+    // that peeks the socket for the first reply sees the tickets instead —
+    // and the bounded reply wait (a write giving a late replica up) turned
+    // into a blocking read of the real reply. The price: a re-dial is a full
+    // handshake, not a resumed session (connections are pooled, so re-dials
+    // are the exception — a dropped mid-reply connection, a restart).
+    cfg.send_tls13_tickets = 0;
     Ok(Arc::new(cfg))
 }
 

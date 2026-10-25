@@ -43,9 +43,23 @@ impl Value {
             Value::Bool(b) => Json::Bool(*b),
             Value::Int(i) => Json::Number((*i).into()),
             Value::Timestamp(t) => Json::Number((*t).into()),
-            Value::Float(f) => serde_json::Number::from_f64(*f)
-                .map(Json::Number)
-                .unwrap_or(Json::Null),
+            // JSON has no non-finite numbers. They render as the strings
+            // `"Infinity"`, `"-Infinity"` and `"NaN"` — never as `null`,
+            // which is how SQL NULL renders: a stored +inf (`1e309`) must
+            // not read back as "no value".
+            Value::Float(f) => match serde_json::Number::from_f64(*f) {
+                Some(n) => Json::Number(n),
+                None => Json::String(
+                    if f.is_nan() {
+                        "NaN"
+                    } else if *f > 0.0 {
+                        "Infinity"
+                    } else {
+                        "-Infinity"
+                    }
+                    .into(),
+                ),
+            },
             Value::Decimal(d) => Json::String(d.to_string()),
             Value::String(s) => Json::String(s.clone()),
             Value::Bytes(b) => {
@@ -83,6 +97,24 @@ mod tests {
         let v = Value::from_json(json.clone());
         // Object becomes a Document with sorted keys; round-trips back to JSON.
         assert_eq!(v.to_json(), json);
+    }
+
+    /// ±Infinity and NaN are values, not NULL: they render as strings, and
+    /// stay distinguishable from `null` inside arrays and documents too.
+    #[test]
+    fn non_finite_floats_render_as_strings_not_null() {
+        assert_eq!(Value::Float(f64::INFINITY).to_json(), serde_json::json!("Infinity"));
+        assert_eq!(Value::Float(f64::NEG_INFINITY).to_json(), serde_json::json!("-Infinity"));
+        assert_eq!(Value::Float(f64::NAN).to_json(), serde_json::json!("NaN"));
+        assert_eq!(Value::Float(1.5).to_json(), serde_json::json!(1.5));
+        assert_eq!(Value::Float(-0.0).to_json().to_string(), "-0.0");
+        assert_eq!(Value::Null.to_json(), Json::Null);
+        let mut doc = Document::new();
+        doc.insert("v", Value::Array(vec![Value::Float(f64::INFINITY), Value::Null]));
+        assert_eq!(
+            Value::Document(doc).to_json(),
+            serde_json::json!({"v": ["Infinity", null]})
+        );
     }
 
     #[test]
