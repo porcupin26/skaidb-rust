@@ -870,13 +870,14 @@ pub unsafe extern "C" fn skaidb_result_free(result: *mut skaidb_result) {
 unsafe fn open_stream(
     client: *mut skaidb_client,
     sql: *const c_char,
+    params: &[Value],
     consistency: Option<skaidb_consistency>,
 ) -> Result<skaidb_stream, skaidb_status> {
     let c = client_mut(client)?;
     let sql = cstr(sql, "sql")?;
     let stream = match consistency {
-        Some(cons) => c.query_stream_with(sql, consistency_of(cons)),
-        None => c.query_stream(sql),
+        Some(cons) => c.query_stream_params_with(sql, params, consistency_of(cons)),
+        None => c.query_stream_params(sql, params),
     }
     .map_err(fail_driver)?;
     // Erase the client borrow: the header's contract (no client use while a
@@ -898,7 +899,7 @@ pub unsafe extern "C" fn skaidb_query_stream(
     sql: *const c_char,
     out: *mut *mut skaidb_stream,
 ) -> skaidb_status {
-    boxed(out, || open_stream(client, sql, None))
+    boxed(out, || open_stream(client, sql, &[], None))
 }
 
 #[no_mangle]
@@ -908,7 +909,39 @@ pub unsafe extern "C" fn skaidb_query_stream_with(
     consistency: skaidb_consistency,
     out: *mut *mut skaidb_stream,
 ) -> skaidb_status {
-    boxed(out, || open_stream(client, sql, Some(consistency)))
+    boxed(out, || open_stream(client, sql, &[], Some(consistency)))
+}
+
+/// [`skaidb_query_stream`] with `params` bound to the statement's `?`
+/// placeholders, in order (`OP_QUERY_STREAM_PARAMS`, servers >= 0.330).
+#[no_mangle]
+pub unsafe extern "C" fn skaidb_query_stream_params(
+    client: *mut skaidb_client,
+    sql: *const c_char,
+    params: *const *const skaidb_value,
+    n_params: usize,
+    out: *mut *mut skaidb_stream,
+) -> skaidb_status {
+    boxed(out, || {
+        let params = params_slice(params, n_params)?;
+        open_stream(client, sql, &params, None)
+    })
+}
+
+/// [`skaidb_query_stream_params`] at an explicit consistency.
+#[no_mangle]
+pub unsafe extern "C" fn skaidb_query_stream_params_with(
+    client: *mut skaidb_client,
+    sql: *const c_char,
+    params: *const *const skaidb_value,
+    n_params: usize,
+    consistency: skaidb_consistency,
+    out: *mut *mut skaidb_stream,
+) -> skaidb_status {
+    boxed(out, || {
+        let params = params_slice(params, n_params)?;
+        open_stream(client, sql, &params, Some(consistency))
+    })
 }
 
 #[no_mangle]

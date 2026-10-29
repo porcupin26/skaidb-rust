@@ -205,6 +205,15 @@ void skaidb_result_free(skaidb_result_t *result);
 skaidb_status_t skaidb_query_stream(skaidb_client_t *client, const char *sql, skaidb_stream_t **out);
 skaidb_status_t skaidb_query_stream_with(skaidb_client_t *client, const char *sql,
                                          skaidb_consistency_t consistency, skaidb_stream_t **out);
+/* The same with `params` bound to the statement's `?` placeholders, in order
+ * (servers >= 0.330): a bound range streams exactly like a written one. */
+skaidb_status_t skaidb_query_stream_params(skaidb_client_t *client, const char *sql,
+                                           const skaidb_value_t *const *params, size_t n_params,
+                                           skaidb_stream_t **out);
+skaidb_status_t skaidb_query_stream_params_with(skaidb_client_t *client, const char *sql,
+                                                const skaidb_value_t *const *params,
+                                                size_t n_params, skaidb_consistency_t consistency,
+                                                skaidb_stream_t **out);
 size_t skaidb_stream_column_count(const skaidb_stream_t *stream);
 const char *skaidb_stream_column_name(const skaidb_stream_t *stream, size_t column);
 /* For a non-row statement: the affected count (the stream is then empty). */

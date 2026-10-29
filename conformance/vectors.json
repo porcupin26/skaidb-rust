@@ -640,6 +640,79 @@
       "name": "stream_rows"
     },
     {
+      "about": "OP_QUERY_STREAM_PARAMS: a streamed statement with bound parameters — the SQL, then the parameter vector OP_EXECUTE carries; the reply is an ordinary stream.",
+      "call": {
+        "method": "query_stream",
+        "params": [
+          {
+            "int": "7"
+          },
+          {
+            "string": "o'neil"
+          },
+          {
+            "float": 2.5,
+            "float_bits": "4004000000000000"
+          },
+          {
+            "bool": true
+          },
+          {
+            "null": true
+          },
+          {
+            "bytes": "dead"
+          }
+        ],
+        "sql": "SELECT id, name FROM t WHERE a = ? AND b = ? AND c = ? AND d = ? AND e = ? AND f = ?"
+      },
+      "exchanges": [
+        {
+          "request": "09015400000053454c4543542069642c206e616d652046524f4d20742057484552452061203d203f20414e442062203d203f20414e442063203d203f20414e442064203d203f20414e442065203d203f20414e442066203d203f0600090000000207000000000000000b00000005060000006f276e65696c090000000300000000000004400200000001010100000000070000000602000000dead",
+          "responses": [
+            "0502000000020000006964040000006e616d65",
+            "060300000002000000090000000201000000000000000600000005010000006102000000090000000202000000000000000100000000020000000900000002030000000000000006000000050100000063",
+            "07"
+          ]
+        }
+      ],
+      "expect": {
+        "rows": {
+          "columns": [
+            "id",
+            "name"
+          ],
+          "rows": [
+            [
+              {
+                "int": "1"
+              },
+              {
+                "string": "a"
+              }
+            ],
+            [
+              {
+                "int": "2"
+              },
+              {
+                "null": true
+              }
+            ],
+            [
+              {
+                "int": "3"
+              },
+              {
+                "string": "c"
+              }
+            ]
+          ]
+        }
+      },
+      "name": "stream_params"
+    },
+    {
       "about": "A stream may carry no chunk at all, or empty chunks.",
       "call": {
         "method": "query_stream",

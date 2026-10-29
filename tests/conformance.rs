@@ -212,7 +212,11 @@ fn run_call(client: &mut Client, call: &J) -> J {
     match call["method"].as_str().unwrap() {
         "query" => outcome_json(client.execute_with(sql, consistency(call["consistency"].as_str().unwrap()))),
         "query_stream" => {
-            let mut stream = match client.query_stream(sql) {
+            let params: Vec<Value> = call["params"]
+                .as_array()
+                .map(|a| a.iter().map(native).collect())
+                .unwrap_or_default();
+            let mut stream = match client.query_stream_params(sql, &params) {
                 Ok(s) => s,
                 Err(e) => return outcome_json(Err(e)),
             };

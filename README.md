@@ -23,7 +23,7 @@ is tested with:
 
 ```toml
 [dependencies]
-skaidb = "0.328"
+skaidb = "0.330"
 ```
 
 Kerberos (GSSAPI) logins are behind the `kerberos` feature, which links the
@@ -32,7 +32,7 @@ MIT krb5 library through `cross-krb5`. Install the development headers first
 macOS and Windows) and enable the feature:
 
 ```toml
-skaidb = { version = "0.328", features = ["kerberos"] }
+skaidb = { version = "0.330", features = ["kerberos"] }
 ```
 
 The feature is off by default and never builds on static musl targets.
@@ -320,6 +320,8 @@ if let Response::Error(msg) = &out[1] { eprintln!("second insert failed: {msg}")
 impl Client {
     pub fn query_stream(&mut self, sql: &str) -> Result<RowStream<'_>, DriverError>;
     pub fn query_stream_with(&mut self, sql: &str, consistency: Consistency) -> Result<RowStream<'_>, DriverError>;
+    pub fn query_stream_params(&mut self, sql: &str, params: &[Value]) -> Result<RowStream<'_>, DriverError>;
+    pub fn query_stream_params_with(&mut self, sql: &str, params: &[Value], consistency: Consistency) -> Result<RowStream<'_>, DriverError>;
 }
 
 pub struct RowStream<'a> {
@@ -333,8 +335,12 @@ impl Iterator for RowStream<'_> { type Item = Result<Vec<Value>, DriverError>; }
 `execute` buffers the whole result set in one frame, which is wrong for a
 table scan. `query_stream` receives rows in chunks and holds at most one
 chunk in memory, and it is also how a result larger than the server's scan
-budget is read at all. Iterate the stream; each item is one row or the
-error that ended the stream.
+budget is read at all: the server pages a plain SELECT, and no scan budget
+applies to a streamed page. Iterate the stream; each item is one row or the
+error that ended the stream. `query_stream_params` binds `?` placeholders
+exactly as `execute_prepared` does (`OP_QUERY_STREAM_PARAMS`, servers ≥
+0.330); without parameters the request is the original `OP_QUERY_STREAM`,
+which every server accepts.
 
 ```rust
 let mut n = 0u64;
@@ -346,6 +352,11 @@ let mut n = 0u64;
     }
 }
 println!("{n} rows");
+
+let since = Value::Timestamp(1_700_000_000_000);
+for row in client.query_stream_params("SELECT id, ts FROM events WHERE ts >= ?", &[since])? {
+    let row = row?;
+}
 ```
 
 **The abandon/drain rule.** A `RowStream` borrows the `Client` exclusively

@@ -67,7 +67,17 @@ pub enum ClientRequest {
     /// ever holds the whole encoded result set. Non-row results are answered
     /// with a single ordinary frame. Old servers reject the opcode with
     /// [`Response::Error`], which callers surface as "server too old".
-    QueryStream { sql: String, consistency: Consistency },
+    ///
+    /// `params` bind the statement's `?` placeholders in order, exactly as
+    /// [`ClientRequest::Execute`] binds a prepared statement's. Empty
+    /// `params` encode as the original [`OP_QUERY_STREAM`]; any parameter
+    /// selects [`OP_QUERY_STREAM_PARAMS`], which servers before 0.330
+    /// reject as an unknown opcode.
+    QueryStream {
+        sql: String,
+        params: Vec<Value>,
+        consistency: Consistency,
+    },
     /// Execute a prepared statement once per parameter row — the wire form of
     /// `executemany`: one round-trip for a whole bulk backfill instead of one
     /// per row. Each row autocommits like a looped `Execute`; on a failure
@@ -147,6 +157,10 @@ const OP_TAGGED: u8 = 6;
 const OP_EXECUTE_BATCH: u8 = 7;
 /// `u8 OP_HELLO | u32 name_len | name | u32 version_len | version`.
 const OP_HELLO: u8 = 8;
+/// `u8 OP_QUERY_STREAM_PARAMS | u8 consistency | u32 sql_len | sql |
+///  u16 nparams | nparams × (u32 len | value bytes)` — `OP_QUERY_STREAM`
+/// with bound parameters.
+const OP_QUERY_STREAM_PARAMS: u8 = 9;
 const RESP_ROWS: u8 = 0;
 const RESP_MUTATION: u8 = 1;
 const RESP_DDL: u8 = 2;
@@ -279,10 +293,28 @@ impl ClientRequest {
                 out.push(OP_CLOSE);
                 out.extend_from_slice(&id.to_le_bytes());
             }
-            ClientRequest::QueryStream { sql, consistency } => {
-                out.push(OP_QUERY_STREAM);
+            ClientRequest::QueryStream {
+                sql,
+                params,
+                consistency,
+            } => {
+                out.push(if params.is_empty() {
+                    OP_QUERY_STREAM
+                } else {
+                    OP_QUERY_STREAM_PARAMS
+                });
                 out.push(consistency.to_u8());
                 write_bytes(out, sql.as_bytes());
+                if !params.is_empty() {
+                    out.extend_from_slice(&(params.len() as u16).to_le_bytes());
+                    for v in params {
+                        let len_pos = out.len();
+                        out.extend_from_slice(&[0u8; 4]);
+                        v.encode_value_into(out);
+                        let len = (out.len() - len_pos - 4) as u32;
+                        out[len_pos..len_pos + 4].copy_from_slice(&len.to_le_bytes());
+                    }
+                }
             }
             ClientRequest::Hello {
                 client_name,
@@ -381,6 +413,26 @@ impl ClientRequest {
                     .ok_or(ProtoError::Malformed("bad consistency"))?;
                 ClientRequest::QueryStream {
                     sql: c.string()?,
+                    params: Vec::new(),
+                    consistency,
+                }
+            }
+            OP_QUERY_STREAM_PARAMS => {
+                let consistency = Consistency::from_u8(c.u8()?)
+                    .ok_or(ProtoError::Malformed("bad consistency"))?;
+                let sql = c.string()?;
+                let nparams = u16::from_le_bytes(c.take(2)?.try_into().unwrap()) as usize;
+                let mut params = Vec::with_capacity(nparams.min(c.remaining() / 4));
+                for _ in 0..nparams {
+                    let bytes = c.bytes()?;
+                    params.push(
+                        Value::decode(bytes)
+                            .map_err(|_| ProtoError::Malformed("bad value encoding"))?,
+                    );
+                }
+                ClientRequest::QueryStream {
+                    sql,
+                    params,
                     consistency,
                 }
             }
@@ -760,9 +812,33 @@ mod tests {
     fn query_stream_request_roundtrips() {
         let req = ClientRequest::QueryStream {
             sql: "SELECT * FROM big".into(),
+            params: Vec::new(),
             consistency: Consistency::One,
         };
-        assert_eq!(ClientRequest::decode(&req.encode()).unwrap(), req);
+        let bytes = req.encode();
+        assert_eq!(bytes[0], OP_QUERY_STREAM, "no parameters: the original opcode");
+        assert_eq!(ClientRequest::decode(&bytes).unwrap(), req);
+    }
+
+    /// Parameters select `OP_QUERY_STREAM_PARAMS`: the SQL, then the same
+    /// parameter vector `OP_EXECUTE` carries — every value type survives.
+    #[test]
+    fn parameterised_query_stream_request_roundtrips() {
+        let req = ClientRequest::QueryStream {
+            sql: "SELECT id FROM t WHERE ts >= ? AND kind = ?".into(),
+            params: vec![
+                Value::Timestamp(1_700_000_000_000),
+                Value::String("a".into()),
+                Value::Null,
+                Value::Array(vec![Value::Int(1), Value::Float(2.5)]),
+            ],
+            consistency: Consistency::Quorum,
+        };
+        let bytes = req.encode();
+        assert_eq!(bytes[0], OP_QUERY_STREAM_PARAMS);
+        assert_eq!(ClientRequest::decode(&bytes).unwrap(), req);
+        // A truncated parameter vector is malformed, not a shorter list.
+        assert!(ClientRequest::decode(&bytes[..bytes.len() - 3]).is_err());
     }
 
     #[test]

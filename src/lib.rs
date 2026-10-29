@@ -854,8 +854,34 @@ impl Client {
         sql: &str,
         consistency: Consistency,
     ) -> Result<RowStream<'_>, DriverError> {
+        self.query_stream_params_with(sql, &[], consistency)
+    }
+
+    /// [`Client::query_stream`] with `params` bound to the statement's `?`
+    /// placeholders, in order — a bound range streams exactly like a
+    /// written one (the server binds them as `execute_prepared` does). At
+    /// the default consistency; see [`Client::query_stream_params_with`].
+    pub fn query_stream_params(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<RowStream<'_>, DriverError> {
+        self.query_stream_params_with(sql, params, self.default_consistency)
+    }
+
+    /// [`Client::query_stream_with`] with bound parameters. Parameters
+    /// travel in `OP_QUERY_STREAM_PARAMS` (servers ≥ 0.330); without any,
+    /// the request is the original `OP_QUERY_STREAM`, so a parameterless
+    /// stream still works against older servers.
+    pub fn query_stream_params_with(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        consistency: Consistency,
+    ) -> Result<RowStream<'_>, DriverError> {
         let req = ClientRequest::QueryStream {
             sql: sql.to_string(),
+            params: params.to_vec(),
             consistency,
         };
         let mut started = Instant::now();

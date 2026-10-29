@@ -55,7 +55,7 @@ Each entry of `cases` has a `call`, one or more `exchanges`, and an
 | `call.method`      | The driver API to use                                                     |
 |--------------------|---------------------------------------------------------------------------|
 | `query`            | run `call.sql` at `call.consistency` (one / quorum / all)                  |
-| `query_stream`     | the streaming query API (`OP_QUERY_STREAM`), iterating every row           |
+| `query_stream`     | the streaming query API (`OP_QUERY_STREAM`), iterating every row; with `call.params` (tagged JSON values), its parameterised form (`OP_QUERY_STREAM_PARAMS`) |
 | `execute_prepared` | prepare `call.sql`, execute it with `call.params` (tagged JSON values)     |
 | `execute_batch`    | prepare `call.sql`, run the batch API (`OP_EXECUTE_BATCH`) with `call.rows` |
 | `sequence`         | run each of `call.calls` in order on the same connection                  |

@@ -176,6 +176,20 @@ int main(void) {
     CHECK(skaidb_query_stream(c, "SELECT id FROM cffi_smoke", &stm));
     CHECK(skaidb_stream_next(stm, &row, &nc));
     skaidb_stream_free(stm);
+    /* A streamed statement with bound parameters. */
+    skaidb_value_t *lo = skaidb_value_int(2);
+    const skaidb_value_t *sp[] = {lo};
+    CHECK(skaidb_query_stream_params(c, "SELECT id FROM cffi_smoke WHERE id >= ? ORDER BY id", sp, 1,
+                                     &stm));
+    sum = 0;
+    seen = 0;
+    while ((ss = skaidb_stream_next(stm, &row, &nc)) == SKAIDB_OK) {
+        sum += skaidb_value_get_int(row[0]);
+        seen++;
+    }
+    ASSERT(ss == SKAIDB_END && seen == 3 && sum == 9);
+    skaidb_stream_free(stm);
+    skaidb_value_free(lo);
     CHECK(skaidb_execute(c, "SELECT count(*) FROM cffi_smoke", &r));
     ASSERT(skaidb_value_get_int(skaidb_result_cell(r, 0, 0)) == 4);
     skaidb_result_free(r);
