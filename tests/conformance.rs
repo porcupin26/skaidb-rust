@@ -366,3 +366,108 @@ fn cases() {
     }
     assert!(failures.is_empty(), "{} case(s) failed:\n{}", failures.len(), failures.join("\n"));
 }
+
+// ---- beyond the vectors: a streamed CALL whose body EMITs (PROTOCOL.md §3.2)
+
+/// `u32` little-endian, as every length and count on the wire.
+fn le32(n: usize) -> Vec<u8> {
+    (n as u32).to_le_bytes().to_vec()
+}
+
+/// A length-prefixed UTF-8 string.
+fn wire_text(s: &str) -> Vec<u8> {
+    [le32(s.len()), s.as_bytes().to_vec()].concat()
+}
+
+/// A Rows body of one TEXT column: the column block, then the rows, each
+/// cell a length-prefixed String value (tag 5). Built from the spec, not
+/// with the driver's encoder.
+fn one_column_rows(column: &str, cells: &[&str]) -> Vec<u8> {
+    let mut b = [le32(1), wire_text(column), le32(cells.len())].concat();
+    for c in cells {
+        let value = [vec![5u8], wire_text(c)].concat();
+        b.extend([le32(1), le32(value.len()), value].concat());
+    }
+    b
+}
+
+/// The server answers a CALL whose body EMITs with ONE ResultSets frame, to
+/// a stream request too: the stream starts on the first set,
+/// `next_result_set` walks the rest, and nothing is left on the socket.
+#[test]
+fn a_streamed_call_returns_its_result_sets() {
+    let v = vectors();
+    let user = v["auth"]["username"].as_str().unwrap().to_string();
+    let pass = v["auth"]["password"].as_str().unwrap().to_string();
+    // [a: x, y] then [b: z].
+    let sets = [
+        vec![8u8],
+        le32(2),
+        one_column_rows("a", &["x", "y"]),
+        one_column_rows("b", &["z"]),
+    ]
+    .concat();
+    let quorum = 1u8;
+    let bound = "CALL report(?)";
+    let five = [vec![2u8], 5i64.to_le_bytes().to_vec()].concat(); // Int 5
+    let with_params = [
+        vec![9u8, quorum],
+        wire_text(bound),
+        1u16.to_le_bytes().to_vec(),
+        le32(five.len()),
+        five,
+    ]
+    .concat();
+    let plain = [vec![5u8, quorum], wire_text("CALL report()")].concat();
+    let query = [vec![1u8, quorum], wire_text("SELECT 1")].concat();
+    let one = [
+        vec![0u8],
+        le32(1),
+        wire_text("x"),
+        le32(1),
+        le32(1),
+        le32(9),
+        vec![2u8],
+        1i64.to_le_bytes().to_vec(),
+    ]
+    .concat();
+    let (addr, h) = fake_server(
+        &v,
+        Outcome::Ok,
+        vec![
+            (with_params, vec![sets.clone()]),
+            (plain, vec![sets]),
+            (query, vec![one]),
+        ],
+    );
+    {
+        let mut client = Client::connect_with(addr.as_str(), &user, &pass).expect("connect");
+        for (sql, params) in [(bound, vec![Value::Int(5)]), ("CALL report()", vec![])] {
+            let mut stream = client.query_stream_params(sql, &params).expect(sql);
+            let mut walked = Vec::new();
+            loop {
+                let mut set = format!("{}:", stream.columns.join(","));
+                for row in stream.by_ref() {
+                    match row.expect("row").as_slice() {
+                        [Value::String(s)] => set.push_str(s),
+                        other => panic!("{sql}: unexpected row {other:?}"),
+                    }
+                }
+                walked.push(set);
+                if !stream.next_result_set() {
+                    break;
+                }
+            }
+            assert_eq!(walked.join("|"), "a:xy|b:z", "{sql}");
+            assert!(!stream.next_result_set());
+        }
+        // The same socket answers the next statement: nothing was left on it.
+        match client.execute("SELECT 1").expect("the next statement") {
+            Response::Rows { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(1)]]),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    h.join()
+        .unwrap()
+        .unwrap_or_else(|e| panic!("server saw: {e}"));
+}

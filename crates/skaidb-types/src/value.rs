@@ -472,6 +472,51 @@ pub fn decode_numeric_key(component: &[u8]) -> Option<Value> {
     }
 }
 
+/// Exact comparison of a 64-bit integer with a decimal: the mathematical
+/// order of the two numbers. Through the decimal's `f64` projection an
+/// integer beyond 2^53 equalled its neighbours (`9007199254740993 =
+/// 9007199254740992` held), and so could a key's `=`-twin.
+pub fn cmp_i64_decimal(i: i64, d: Decimal) -> Ordering {
+    // d = whole + frac / 10^scale, both truncated toward zero (so `frac`
+    // carries d's sign). A scale past i128's 38 digits leaves no whole part:
+    // every mantissa is smaller than 10^39.
+    let (whole, frac) = match 10i128.checked_pow(d.scale) {
+        Some(pow) => (d.mantissa / pow, d.mantissa % pow),
+        None => (0, d.mantissa),
+    };
+    match i128::from(i).cmp(&whole) {
+        Ordering::Equal => 0.cmp(&frac),
+        other => other,
+    }
+}
+
+/// Exact comparison of two decimals: the scales aligned on the mantissa of
+/// the one with fewer digits. A mantissa scaled past i128 exceeds every
+/// other mantissa in magnitude, so its sign decides.
+pub fn cmp_decimal(a: Decimal, b: Decimal) -> Ordering {
+    if a.scale == b.scale {
+        return a.mantissa.cmp(&b.mantissa);
+    }
+    // Scale the mantissa with the smaller scale up to the larger one.
+    let (small, large, flip) = if a.scale < b.scale {
+        (a, b, false)
+    } else {
+        (b, a, true)
+    };
+    let scaled = 10i128
+        .checked_pow(large.scale - small.scale)
+        .and_then(|pow| small.mantissa.checked_mul(pow));
+    let ord = match scaled {
+        Some(m) => m.cmp(&large.mantissa),
+        None => small.mantissa.cmp(&0),
+    };
+    if flip {
+        ord.reverse()
+    } else {
+        ord
+    }
+}
+
 /// Exact comparison of a 64-bit integer with a double: the mathematical
 /// order of the two numbers, with no rounding of the integer. An `i64`
 /// beyond 2^53 has no exact `f64`, so comparing through `i as f64` makes
@@ -676,6 +721,35 @@ mod tests {
         assert!(!i64_is_exact_f64(two53 + 1));
         assert!(!i64_is_exact_f64(i64::MAX));
         assert!(i64_is_exact_f64(i64::MIN));
+    }
+
+    #[test]
+    fn decimal_comparison_is_exact() {
+        use Ordering::*;
+        let d = Decimal::new;
+        let two53 = 9_007_199_254_740_992i64;
+        // Beyond 2^53 the f64 projection made these equal.
+        assert_eq!(cmp_i64_decimal(two53 + 1, d(i128::from(two53), 0)), Greater);
+        assert_eq!(cmp_i64_decimal(two53 + 1, d(i128::from(two53 + 1) * 1000, 3)), Equal);
+        // Fractions either side of the integer, negative values included.
+        assert_eq!(cmp_i64_decimal(1, d(15, 1)), Less);
+        assert_eq!(cmp_i64_decimal(2, d(15, 1)), Greater);
+        assert_eq!(cmp_i64_decimal(-1, d(-15, 1)), Greater);
+        assert_eq!(cmp_i64_decimal(-2, d(-15, 1)), Less);
+        assert_eq!(cmp_i64_decimal(0, d(-1, 40)), Greater, "a scale past i128's digits");
+        assert_eq!(cmp_i64_decimal(0, d(1, 40)), Less);
+        assert_eq!(cmp_i64_decimal(0, d(0, 40)), Equal);
+        assert_eq!(cmp_i64_decimal(i64::MAX, d(i128::from(i64::MAX) + 1, 0)), Less);
+        assert_eq!(cmp_i64_decimal(i64::MIN, d(i128::from(i64::MIN), 0)), Equal);
+        // Decimal against decimal: aligned scales, then the mantissa.
+        assert_eq!(cmp_decimal(d(10, 1), d(100, 2)), Equal, "1.0 = 1.00");
+        assert_eq!(cmp_decimal(d(1_000_000_000_000_000_001, 18), d(1_000_000_000_000_000_002, 18)), Less);
+        assert_eq!(cmp_decimal(d(1, 0), d(1_000_000_000_000_000_001, 18)), Less);
+        assert_eq!(cmp_decimal(d(1_000_000_000_000_000_001, 18), d(1, 0)), Greater);
+        // A rescale past i128: the sign decides.
+        assert_eq!(cmp_decimal(d(5, 0), d(i128::MAX, 40)), Greater);
+        assert_eq!(cmp_decimal(d(-5, 0), d(i128::MAX, 40)), Less);
+        assert_eq!(cmp_decimal(d(i128::MAX, 40), d(5, 0)), Less);
     }
 
     #[test]

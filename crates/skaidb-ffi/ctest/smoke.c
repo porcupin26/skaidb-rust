@@ -1,7 +1,8 @@
 /* libskaidb C smoke test: connect, DDL, typed parameters through a prepared
  * statement, a batch, a read-back with every value accessor, a pipeline
- * with an inline error, a streamed result (and an abandoned one), values
- * on their own, and the pools (plain and balanced). Run by ctest/run.sh. */
+ * with an inline error, a streamed result (and an abandoned one), the
+ * result sets of a streamed CALL, values on their own, and the pools (plain
+ * and balanced). Run by ctest/run.sh. */
 #include "skaidb.h"
 
 #include <inttypes.h>
@@ -190,6 +191,51 @@ int main(void) {
     ASSERT(ss == SKAIDB_END && seen == 3 && sum == 9);
     skaidb_stream_free(stm);
     skaidb_value_free(lo);
+    /* A CALL whose body EMITs is answered with every set in one frame, even
+     * when streamed: the stream starts on the first set and
+     * skaidb_stream_next_set walks the rest. With and without parameters. */
+    CHECK(skaidb_execute(c, "DROP PROCEDURE IF EXISTS cffi_report", &r));
+    skaidb_result_free(r);
+    CHECK(skaidb_execute(c,
+                         "CREATE PROCEDURE cffi_report(lo INT) BEGIN "
+                         "EMIT SELECT id FROM cffi_smoke WHERE id >= lo ORDER BY id; "
+                         "SELECT count(*) AS n FROM cffi_smoke; END",
+                         &r));
+    skaidb_result_free(r);
+    skaidb_value_t *three = skaidb_value_int(3);
+    const skaidb_value_t *cp[] = {three};
+    for (int bound = 1; bound >= 0; bound--) {
+        if (bound)
+            CHECK(skaidb_query_stream_params(c, "CALL cffi_report(?)", cp, 1, &stm));
+        else
+            CHECK(skaidb_query_stream(c, "CALL cffi_report(3)", &stm));
+        const char *first_col = skaidb_stream_column_name(stm, 0);
+        ASSERT(skaidb_stream_column_count(stm) == 1 && strcmp(first_col, "id") == 0);
+        sum = 0;
+        seen = 0;
+        while ((ss = skaidb_stream_next(stm, &row, &nc)) == SKAIDB_OK) {
+            sum += skaidb_value_get_int(row[0]);
+            seen++;
+        }
+        ASSERT(ss == SKAIDB_END && seen == 2 && sum == 7);
+        CHECK(skaidb_stream_next_set(stm));
+        ASSERT(strcmp(skaidb_stream_column_name(stm, 0), "n") == 0);
+        ASSERT(strcmp(first_col, "id") == 0); /* a name handed out lives until the free */
+        CHECK(skaidb_stream_next(stm, &row, &nc));
+        ASSERT(nc == 1 && skaidb_value_get_int(row[0]) == 4);
+        ASSERT(skaidb_stream_next(stm, &row, &nc) == SKAIDB_END);
+        ASSERT(skaidb_stream_next_set(stm) == SKAIDB_END);
+        skaidb_stream_free(stm);
+    }
+    skaidb_value_free(three);
+    /* A real stream has one set. */
+    CHECK(skaidb_query_stream(c, "SELECT id FROM cffi_smoke", &stm));
+    while (skaidb_stream_next(stm, &row, &nc) == SKAIDB_OK) {
+    }
+    ASSERT(skaidb_stream_next_set(stm) == SKAIDB_END);
+    skaidb_stream_free(stm);
+    CHECK(skaidb_execute(c, "DROP PROCEDURE cffi_report", &r));
+    skaidb_result_free(r);
     CHECK(skaidb_execute(c, "SELECT count(*) FROM cffi_smoke", &r));
     ASSERT(skaidb_value_get_int(skaidb_result_cell(r, 0, 0)) == 4);
     skaidb_result_free(r);

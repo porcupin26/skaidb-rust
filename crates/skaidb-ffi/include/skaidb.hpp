@@ -521,6 +521,15 @@ public:
         detail::check(s);
         return Row(cells, n);
     }
+    /* Move to the next result set of a CALL whose body EMITs (all of them
+     * arrive in one frame, the stream starting on the first); false when
+     * there is none — always, for a streamed result. */
+    bool next_set() {
+        skaidb_status_t s = skaidb_stream_next_set(p_.get());
+        if (s == SKAIDB_END) return false;
+        detail::check(s);
+        return true;
+    }
     skaidb_stream_t *raw() const noexcept { return p_.get(); }
 
     class iterator {

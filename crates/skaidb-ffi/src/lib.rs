@@ -151,6 +151,9 @@ pub struct skaidb_results(Vec<skaidb_result>);
 pub struct skaidb_stream {
     stream: RowStream<'static>,
     columns: Vec<CString>,
+    /// Column names of the sets `skaidb_stream_next_set` moved past, kept:
+    /// a column name handed out stays valid until the stream is freed.
+    past_columns: Vec<Vec<CString>>,
     current: Vec<Value>,
     /// `current` as the array of cell pointers `skaidb_stream_next` hands
     /// out (`skaidb_value_t` is opaque to C, so a row is pointers).
@@ -888,6 +891,7 @@ unsafe fn open_stream(
     Ok(skaidb_stream {
         stream,
         columns,
+        past_columns: Vec::new(),
         current: Vec::new(),
         current_ptrs: Vec::new(),
     })
@@ -1006,6 +1010,26 @@ pub unsafe extern "C" fn skaidb_stream_next(
             SKAIDB_END
         }
     }
+}
+
+/// Advance to the next result set of a multi-set reply: a `CALL` whose body
+/// `EMIT`s result sets is answered with all of them in one frame, even when
+/// streamed, and the stream starts on the first. The column accessors and
+/// [`skaidb_stream_next`] then describe the next set. `SKAIDB_END` when there
+/// is no further set — always, for a streamed result.
+#[no_mangle]
+pub unsafe extern "C" fn skaidb_stream_next_set(stream: *mut skaidb_stream) -> skaidb_status {
+    if stream.is_null() {
+        return fail(SKAIDB_ERR_INVALID, "stream is NULL");
+    }
+    let s = &mut *stream;
+    if !s.stream.next_result_set() {
+        return SKAIDB_END;
+    }
+    let names = s.stream.columns.iter().map(|c| c_string_lossy(c)).collect();
+    s.past_columns
+        .push(std::mem::replace(&mut s.columns, names));
+    SKAIDB_OK
 }
 
 #[no_mangle]

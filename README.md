@@ -23,7 +23,7 @@ is tested with:
 
 ```toml
 [dependencies]
-skaidb = "0.330"
+skaidb = "0.331"
 ```
 
 Kerberos (GSSAPI) logins are behind the `kerberos` feature, which links the
@@ -32,7 +32,7 @@ MIT krb5 library through `cross-krb5`. Install the development headers first
 macOS and Windows) and enable the feature:
 
 ```toml
-skaidb = { version = "0.330", features = ["kerberos"] }
+skaidb = { version = "0.331", features = ["kerberos"] }
 ```
 
 The feature is off by default and never builds on static musl targets.
@@ -329,6 +329,9 @@ pub struct RowStream<'a> {
     pub affected: u64,          // set when the statement was a mutation
     // …
 }
+impl RowStream<'_> {
+    pub fn next_result_set(&mut self) -> bool;   // the next set of a CALL that EMITs
+}
 impl Iterator for RowStream<'_> { type Item = Result<Vec<Value>, DriverError>; }
 ```
 
@@ -371,6 +374,24 @@ request; a node dying mid-stream surfaces as an `Err` item and marks the
 stream finished, and the caller decides whether to re-run the query (the
 next call on the client fails over as usual). Non-row statements yield an
 empty stream with `affected` set.
+
+A `CALL` whose procedure body `EMIT`s result sets is answered with all of
+them in one frame even when streamed — the `Response::ResultSets` that
+`execute` returns. The stream then holds nothing on the wire: it starts on
+the first set, and `next_result_set` moves `columns` and the iteration to
+the next one (`false` when there is none, always for a streamed result):
+
+```rust
+let mut stream = client.query_stream("CALL report()")?;
+loop {
+    for row in stream.by_ref() {
+        let row = row?;
+    }
+    if !stream.next_result_set() {
+        break;
+    }
+}
+```
 
 ## Streams (change feeds)
 

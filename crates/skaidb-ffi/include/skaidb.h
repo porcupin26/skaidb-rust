@@ -223,6 +223,16 @@ uint64_t skaidb_stream_affected(const skaidb_stream_t *stream);
  * an error item ends the stream too. */
 skaidb_status_t skaidb_stream_next(skaidb_stream_t *stream, const skaidb_value_t *const **row,
                                    size_t *n_columns);
+/* A CALL whose body EMITs result sets is answered with all of them in one
+ * frame, even when streamed: the stream starts on the first set, and this
+ * moves to the next — the column accessors and skaidb_stream_next then
+ * describe it (column names already handed out stay valid until the free).
+ * SKAIDB_END when there is no further set: always, for a streamed result.
+ *
+ *     do { while (skaidb_stream_next(s, &row, &n) == SKAIDB_OK) { ... } }
+ *     while (skaidb_stream_next_set(s) == SKAIDB_OK);
+ */
+skaidb_status_t skaidb_stream_next_set(skaidb_stream_t *stream);
 /* Reads and discards any remaining rows so the connection is reusable. To
  * abandon a huge stream cheaply, free the CLIENT instead. */
 void skaidb_stream_free(skaidb_stream_t *stream);

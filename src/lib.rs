@@ -840,7 +840,9 @@ impl Client {
     /// Run a query whose result arrives as a stream of row chunks, so the
     /// client never holds more than one chunk in memory — use this for result
     /// sets too large to buffer. Non-row statements yield an empty stream
-    /// (check [`RowStream::affected`]).
+    /// (check [`RowStream::affected`]); a `CALL` whose body `EMIT`s result
+    /// sets yields its first set, and [`RowStream::next_result_set`] walks
+    /// the rest.
     ///
     /// The returned [`RowStream`] borrows the connection exclusively until it
     /// is drained or dropped (dropping it reads and discards the rest of the
@@ -899,7 +901,10 @@ impl Client {
         let resp = Response::decode(&payload)?;
         if matches!(
             resp,
-            Response::RowsHeader { .. } | Response::Mutation { .. } | Response::Ddl
+            Response::RowsHeader { .. }
+                | Response::Mutation { .. }
+                | Response::Ddl
+                | Response::ResultSets { .. }
         ) {
             self.observe_statement(sql);
         }
@@ -910,6 +915,7 @@ impl Client {
                 columns,
                 affected: 0,
                 chunk: Vec::new().into_iter(),
+                more: Vec::new().into_iter(),
                 done: false,
             }),
             // Non-row statement: a single ordinary response ends the exchange.
@@ -918,6 +924,7 @@ impl Client {
                 columns: Vec::new(),
                 affected,
                 chunk: Vec::new().into_iter(),
+                more: Vec::new().into_iter(),
                 done: true,
             }),
             Response::Ddl => Ok(RowStream {
@@ -925,8 +932,26 @@ impl Client {
                 columns: Vec::new(),
                 affected: 0,
                 chunk: Vec::new().into_iter(),
+                more: Vec::new().into_iter(),
                 done: true,
             }),
+            // A CALL whose body EMITted: every set in ONE ordinary frame,
+            // streamed or not — the frame `execute` receives, decoded by the
+            // same `Response::decode`. The exchange is over, so the stream
+            // owns nothing: the first set is current and
+            // [`RowStream::next_result_set`] walks the rest.
+            Response::ResultSets { sets } => {
+                let mut sets = sets.into_iter();
+                let (columns, rows) = sets.next().unwrap_or_default();
+                Ok(RowStream {
+                    client: self,
+                    columns,
+                    affected: 0,
+                    chunk: rows.into_iter(),
+                    more: sets,
+                    done: true,
+                })
+            }
             other => Err(DriverError::Server(format!(
                 "unexpected response to QueryStream: {other:?}"
             ))),
@@ -1001,6 +1026,10 @@ impl Client {
 /// rows chunk by chunk. Holds at most one chunk in memory. Borrows the
 /// [`Client`] exclusively; dropping the stream early drains the remaining
 /// frames so the connection stays usable.
+///
+/// A `CALL` whose procedure body `EMIT`s result sets is answered with all of
+/// them in one frame, streamed or not: the stream starts on the first set
+/// and [`RowStream::next_result_set`] walks the rest.
 #[derive(Debug)]
 pub struct RowStream<'a> {
     client: &'a mut Client,
@@ -1009,10 +1038,29 @@ pub struct RowStream<'a> {
     /// Rows affected, when the statement turned out to be a mutation.
     pub affected: u64,
     chunk: std::vec::IntoIter<Vec<Value>>,
+    /// The sets after the current one, of a `CALL` whose body `EMIT`ted.
+    more: std::vec::IntoIter<(Vec<String>, Vec<Vec<Value>>)>,
     done: bool,
 }
 
 impl RowStream<'_> {
+    /// Advance to the next result set of a multi-set reply: a `CALL` whose
+    /// procedure body `EMIT`s result sets is answered with all of them in
+    /// one frame, even to a stream request, and the stream starts on the
+    /// first. [`RowStream::columns`] and the iteration then describe the next
+    /// set. `false` when there is no further set — always, for a streamed
+    /// result.
+    pub fn next_result_set(&mut self) -> bool {
+        match self.more.next() {
+            Some((columns, rows)) => {
+                self.columns = columns;
+                self.chunk = rows.into_iter();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Fetch the next frame after the current chunk ran dry.
     fn next_frame(&mut self) -> Result<(), DriverError> {
         let frame = read_frame(&mut self.client.stream);

@@ -110,6 +110,25 @@ int main() {
         ASSERT(first && first->size() == 2);
     }
     ASSERT(c.execute("SELECT count(*) FROM cppffi_smoke")[0][0].as_int() == 4);
+    // A CALL whose body EMITs is answered with every set in one frame, even
+    // when streamed: the stream starts on the first set, next_set() walks
+    // the rest.
+    c.execute("DROP PROCEDURE IF EXISTS cppffi_report");
+    c.execute("CREATE PROCEDURE cppffi_report(lo INT) BEGIN "
+              "EMIT SELECT id FROM cppffi_smoke WHERE id >= lo ORDER BY id; "
+              "SELECT count(*) AS n FROM cppffi_smoke; END");
+    {
+        auto st = c.query_stream("CALL cppffi_report(3)");
+        std::vector<std::string> walked;
+        do {
+            std::string set = st.column_name(0) + ":";
+            for (const skaidb::Row &row : st) set += std::to_string(row[0].as_int());
+            walked.push_back(set);
+        } while (st.next_set());
+        ASSERT(walked.size() == 2 && walked[0] == "id:34" && walked[1] == "n:4");
+    }
+    c.execute("DROP PROCEDURE cppffi_report");
+    ASSERT(c.execute("SELECT count(*) FROM cppffi_smoke")[0][0].as_int() == 4);
 
     // Values.
     ASSERT(skaidb::Value::decimal("12.50").str() == "12.50");
