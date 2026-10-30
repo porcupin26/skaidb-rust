@@ -6,6 +6,7 @@
 //! three-valued logic in [`ternary`].
 
 mod codec;
+pub use codec::FIELD_NAMES_MARKER;
 pub mod diskfull;
 pub mod dir_size;
 mod json;

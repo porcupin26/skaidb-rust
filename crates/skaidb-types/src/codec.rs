@@ -8,6 +8,14 @@
 
 use crate::value::{Decimal, Document, Uuid, Value, ValueError};
 
+/// A member of a [`Value::decode_document_projected`] projection that asks
+/// for every field's NAME as well: fields outside the projection are kept
+/// as `NULL` placeholders, their values skipped, never decoded (and the
+/// engine's TOAST resolution lists out-of-line fields the same way, without
+/// fetching them). What a `SELECT *` column discovery reads. Reserved
+/// prefix: no user field can be named so.
+pub const FIELD_NAMES_MARKER: &str = "\u{1}names";
+
 mod tag {
     pub const NULL: u8 = 0;
     pub const BOOL: u8 = 1;
@@ -93,6 +101,7 @@ impl Value {
             return Err(ValueError::UnrepresentableJson("document field count exceeds input"));
         }
         let mut doc = Document::new();
+        let names = wanted.contains(FIELD_NAMES_MARKER);
         // Small `wanted` sets — the common projection — compare field names
         // as RAW BYTES against each wanted key: no UTF-8 validation and no
         // hashing per name (a wide row hashes+validates ~14 names to keep 2
@@ -119,6 +128,13 @@ impl Value {
                         })?;
                         doc.insert(key.to_owned(), decode_value(&mut cur)?);
                     }
+                    None if names => {
+                        let key = std::str::from_utf8(raw).map_err(|_| {
+                            ValueError::UnrepresentableJson("invalid utf-8 in string")
+                        })?;
+                        doc.insert(key.to_owned(), Value::Null);
+                        skip_value(&mut cur)?;
+                    }
                     None => skip_value(&mut cur)?,
                 }
             }
@@ -128,6 +144,9 @@ impl Value {
                 if wanted.contains(key) || key.as_bytes().first() == Some(&1) {
                     doc.insert(key.to_owned(), decode_value(&mut cur)?);
                 } else {
+                    if names {
+                        doc.insert(key.to_owned(), Value::Null);
+                    }
                     skip_value(&mut cur)?;
                 }
             }
@@ -185,6 +204,28 @@ impl Value {
             ));
         }
         Ok(doc)
+    }
+
+    /// The top-level field names of an encoded document, in stored order,
+    /// with no value decoded — reserved (U+0001) names included; the caller
+    /// skips those.
+    pub fn scan_field_names(bytes: &[u8], mut f: impl FnMut(&str)) -> Result<(), ValueError> {
+        let mut cur = Cursor { bytes, pos: 0 };
+        if cur.u8()? != tag::DOCUMENT {
+            return Err(ValueError::UnrepresentableJson("scan_field_names: not a document"));
+        }
+        let n = cur.u32()? as usize;
+        if n > cur.remaining() / 5 {
+            return Err(ValueError::UnrepresentableJson("document field count exceeds input"));
+        }
+        for _ in 0..n {
+            f(cur.str_ref()?);
+            skip_value(&mut cur)?;
+        }
+        if cur.pos != bytes.len() {
+            return Err(ValueError::UnrepresentableJson("trailing bytes after value"));
+        }
+        Ok(())
     }
 
     /// One borrowed walk over an encoded top-level document: decode ONLY the
