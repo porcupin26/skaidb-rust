@@ -777,6 +777,59 @@
       "name": "stream_error_before_header"
     },
     {
+      "about": "A streamed CALL that EMITs: the reply is the one ResultSets frame the buffered call gets, and the stream walks every set in order (a driver that exposes only the last set compares that one).",
+      "call": {
+        "method": "query_stream",
+        "sql": "CALL p()"
+      },
+      "exchanges": [
+        {
+          "request": "05010800000043414c4c20702829",
+          "responses": [
+            "0802000000010000000100000061020000000100000009000000020100000000000000010000000900000002020000000000000002000000010000006201000000630100000002000000060000000501000000780100000000"
+          ]
+        }
+      ],
+      "expect": {
+        "result_sets": [
+          {
+            "columns": [
+              "a"
+            ],
+            "rows": [
+              [
+                {
+                  "int": "1"
+                }
+              ],
+              [
+                {
+                  "int": "2"
+                }
+              ]
+            ]
+          },
+          {
+            "columns": [
+              "b",
+              "c"
+            ],
+            "rows": [
+              [
+                {
+                  "string": "x"
+                },
+                {
+                  "null": true
+                }
+              ]
+            ]
+          }
+        ]
+      },
+      "name": "stream_result_sets"
+    },
+    {
       "about": "An error mid-stream: the rows delivered before it are valid, then the error surfaces.",
       "call": {
         "method": "query_stream",

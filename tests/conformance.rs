@@ -223,18 +223,29 @@ fn run_call(client: &mut Client, call: &J) -> J {
             if stream.columns.is_empty() {
                 return json!({"affected": stream.affected.to_string()});
             }
-            let columns = stream.columns.clone();
-            let mut rows = Vec::new();
-            for row in stream.by_ref() {
-                match row {
-                    Ok(r) => rows.push(r),
-                    Err(DriverError::Server(msg)) => {
-                        return json!({"rows_then_error": {"rows": rows_json(&columns, &rows), "error": msg}})
+            // Every set: a streamed CALL that EMITs walks them in order.
+            let mut sets = Vec::new();
+            loop {
+                let columns = stream.columns.clone();
+                let mut rows = Vec::new();
+                for row in stream.by_ref() {
+                    match row {
+                        Ok(r) => rows.push(r),
+                        Err(DriverError::Server(msg)) => {
+                            return json!({"rows_then_error": {"rows": rows_json(&columns, &rows), "error": msg}})
+                        }
+                        Err(e) => return json!({"driver_error": e.to_string()}),
                     }
-                    Err(e) => return json!({"driver_error": e.to_string()}),
+                }
+                sets.push(rows_json(&columns, &rows));
+                if !stream.next_result_set() {
+                    break;
                 }
             }
-            json!({"rows": rows_json(&columns, &rows)})
+            match sets.len() {
+                1 => json!({"rows": sets.pop()}),
+                _ => json!({"result_sets": sets}),
+            }
         }
         "execute_prepared" => {
             let mut stmt = client.prepare(sql).expect("prepare");

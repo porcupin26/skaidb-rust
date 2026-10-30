@@ -491,8 +491,8 @@ pub fn cmp_i64_decimal(i: i64, d: Decimal) -> Ordering {
 }
 
 /// Exact comparison of two decimals: the scales aligned on the mantissa of
-/// the one with fewer digits. A mantissa scaled past i128 exceeds every
-/// other mantissa in magnitude, so its sign decides.
+/// the one with fewer digits. A non-zero mantissa scaled past i128 exceeds
+/// every other mantissa in magnitude, so its sign decides.
 pub fn cmp_decimal(a: Decimal, b: Decimal) -> Ordering {
     if a.scale == b.scale {
         return a.mantissa.cmp(&b.mantissa);
@@ -508,6 +508,8 @@ pub fn cmp_decimal(a: Decimal, b: Decimal) -> Ordering {
         .and_then(|pow| small.mantissa.checked_mul(pow));
     let ord = match scaled {
         Some(m) => m.cmp(&large.mantissa),
+        // `10^Δ` itself overflowed (Δ ≥ 39): a zero is still zero.
+        None if small.mantissa == 0 => 0i128.cmp(&large.mantissa),
         None => small.mantissa.cmp(&0),
     };
     if flip {
@@ -750,6 +752,12 @@ mod tests {
         assert_eq!(cmp_decimal(d(5, 0), d(i128::MAX, 40)), Greater);
         assert_eq!(cmp_decimal(d(-5, 0), d(i128::MAX, 40)), Less);
         assert_eq!(cmp_decimal(d(i128::MAX, 40), d(5, 0)), Less);
+        // A zero against a scale 10^Δ cannot reach: still zero (it read
+        // Equal to anything, so `0 = 5E-40`).
+        assert_eq!(cmp_decimal(d(0, 0), d(5, 40)), Less);
+        assert_eq!(cmp_decimal(d(5, 40), d(0, 0)), Greater);
+        assert_eq!(cmp_decimal(d(0, 0), d(-5, 40)), Greater);
+        assert_eq!(cmp_decimal(d(0, 0), d(0, 40)), Equal);
     }
 
     #[test]
