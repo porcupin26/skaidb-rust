@@ -1911,7 +1911,9 @@ impl PoolBuilder {
     /// and on another usable member) is above `factor` × the median of the
     /// other usable members' averages and more than
     /// [`eject_latency_floor`](PoolBuilder::eject_latency_floor) above it
-    /// (default 3.0; 0 disables latency ejection).
+    /// (default 3.0; 0 disables latency ejection). The fastest of a member's
+    /// first three round trips seeds its average, so a statement that stalls
+    /// in the application itself cannot get a healthy member ejected.
     pub fn eject_latency_factor(mut self, factor: f64) -> PoolBuilder {
         self.options.eject_latency_factor = factor;
         self
@@ -2030,10 +2032,14 @@ impl Default for PoolOptions {
     }
 }
 
-// Latency EWMA: each round trip moves a member's average 5% toward it, and no
-// sample counts for more than 10x the larger of the current average and the
-// ejection floor — one slow query does not eject a healthy member, a member
-// that stays slow is ejected within a few dozen statements.
+// Latency EWMA: the fastest of a member's first round trips seeds it (a round
+// trip is only ever lengthened — by the member, the network or this process
+// stalling — so a slow first statement cannot set it); then each round trip
+// moves it 5% toward it, and no sample counts for more than 10x the larger of
+// the current average and the ejection floor — one slow query does not eject
+// a healthy member, a member that stays slow is ejected within a few dozen
+// statements.
+const EWMA_SEED_SAMPLES: usize = 3;
 const EWMA_WEIGHT: f64 = 0.05;
 const EWMA_CLAMP: f64 = 10.0;
 /// Round trips a member (and at least one other) needs before its average
@@ -2109,6 +2115,8 @@ struct Member {
     listed: MemberState,
     /// Round-trip average, in seconds.
     ewma: Option<f64>,
+    /// Round trips before the average is seeded.
+    firsts: Vec<f64>,
     samples: u32,
     last_sample: Option<Instant>,
     /// Consecutive transport failures.
@@ -2128,6 +2136,7 @@ impl Member {
             canonical: None,
             listed: MemberState::Ready,
             ewma: None,
+            firsts: Vec::new(),
             samples: 0,
             last_sample: None,
             errors: 0,
@@ -2137,6 +2146,13 @@ impl Member {
             in_use: 0,
             probing: false,
         }
+    }
+
+    /// Measure the member afresh (a re-admission, back to ready).
+    fn reset_latency(&mut self) {
+        self.ewma = None;
+        self.firsts.clear();
+        self.samples = 0;
     }
 
     /// New connections may go to it.
@@ -2506,18 +2522,25 @@ impl Balancer {
             return;
         };
         let sample = elapsed.as_secs_f64();
-        let ewma = match m.ewma {
-            None => sample,
-            Some(avg) => avg + EWMA_WEIGHT * (sample.min(EWMA_CLAMP * avg.max(floor)) - avg),
-        };
+        match m.ewma {
+            None => {
+                m.firsts.push(sample);
+                if m.firsts.len() >= EWMA_SEED_SAMPLES {
+                    m.ewma = m.firsts.drain(..).reduce(f64::min);
+                }
+            }
+            Some(avg) => m.ewma = Some(avg + EWMA_WEIGHT * (sample.min(EWMA_CLAMP * avg.max(floor)) - avg)),
+        }
         m.errors = 0;
-        m.ewma = Some(ewma);
         m.samples = m.samples.saturating_add(1);
         m.last_sample = Some(Instant::now());
-        // Only a member still in rotation: round trips finishing on
+        // Only a measured member still in rotation: round trips finishing on
         // connections checked out before an ejection must not eject it again
         // (and so double its backoff).
         let factor = self.opts.eject_latency_factor;
+        let Some(ewma) = m.ewma else {
+            return;
+        };
         if !m.usable() || m.samples < EWMA_MIN_SAMPLES || factor <= 0.0 {
             return;
         }
@@ -2656,8 +2679,7 @@ impl Balancer {
             Ok(mut client) if !closed => {
                 m.ejected_until = None;
                 m.errors = 0;
-                m.ewma = None;
-                m.samples = 0;
+                m.reset_latency();
                 m.readmitted_at = Some(Instant::now());
                 if room {
                     let mut link = PoolLink::new(self.clone());
@@ -2806,8 +2828,7 @@ fn apply_listing(members: &mut BTreeMap<String, Member>, dialed: &str, rows: &[V
         };
         if state == MemberState::Ready && m.listed != MemberState::Ready {
             // Back in rotation: measured afresh, like a re-admission.
-            m.ewma = None;
-            m.samples = 0;
+            m.reset_latency();
             m.errors = 0;
         }
         m.listed = state;

@@ -433,6 +433,32 @@ fn one_slow_statement_does_not_eject_a_member() {
 }
 
 #[test]
+fn a_slow_first_round_trip_does_not_eject_a_member() {
+    // b's first statements are slow — as when the client itself stalls while
+    // the application starts — and b answers fast from then on: the fastest
+    // of its first round trips seeds its average, so b stays in rotation.
+    // (Seeded by its first round trip alone, b's average still read ~0.2 s
+    // when the pool first compared it, and b was ejected.)
+    let [a, b, c] = three();
+    let pool = builder(&[&a, &b, &c])
+        .load_balancing(LoadBalancing::RoundRobin)
+        .eject_latency_floor(Duration::from_millis(50))
+        .build()
+        .unwrap();
+    b.delay(300);
+    for _ in 0..2 {
+        while who(&pool) != "b" {}
+    }
+    b.delay(0);
+    for _ in 0..36 {
+        who(&pool);
+    }
+    assert_eq!(state(&pool, &b), MemberState::Ready);
+    let latency = pool.members().into_iter().find(|m| m.endpoint == b.endpoint).unwrap().latency;
+    assert!(latency.is_some_and(|l| l < Duration::from_millis(50)), "{latency:?}");
+}
+
+#[test]
 fn the_last_usable_member_is_never_ejected() {
     let [a, b, c] = three();
     b.refuse(true);
