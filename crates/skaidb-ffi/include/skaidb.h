@@ -383,7 +383,7 @@ typedef struct skaidb_member {
     const char *endpoint;   /* what the pool dials */
     const char *canonical;  /* the member's own SHOW ENDPOINTS name; NULL until discovered */
     const char *state;      /* "ready", "ejected", "resyncing", "unreachable" or "unlisted" */
-    double latency_ms;      /* round-trip average; negative until measured */
+    double latency_ms;      /* round-trip average; negative until measured (its third round trip) */
     size_t in_use;          /* connections checked out */
     size_t idle;            /* idle connections */
     bool seed;              /* a configured endpoint (never dropped) */

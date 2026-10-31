@@ -312,7 +312,8 @@ int main(void) {
     ASSERT(skaidb_members_len(ms) == 1);
     const skaidb_member_t *m = skaidb_members_get(ms, 0);
     ASSERT(m && strcmp(m->endpoint, endpoint) == 0 && m->seed && m->canonical == NULL);
-    ASSERT(strcmp(m->state, "ready") == 0 && m->in_use == 1 && m->idle == 0 && m->latency_ms >= 0);
+    ASSERT(strcmp(m->state, "ready") == 0 && m->in_use == 1 && m->idle == 0);
+    ASSERT(m->latency_ms < 0); /* one round trip: measured from its third */
     ASSERT(skaidb_members_get(ms, 1) == NULL);
     skaidb_members_free(ms);
     skaidb_pool_release(bpool, pc);
@@ -320,12 +321,14 @@ int main(void) {
     CHECK(skaidb_execute(pc, "SELECT count(*) FROM cffi_smoke", &r));
     ASSERT(skaidb_value_get_int(skaidb_result_cell(r, 0, 0)) == 4);
     skaidb_result_free(r);
+    CHECK(skaidb_execute(pc, "SELECT count(*) FROM cffi_smoke", &r));
+    skaidb_result_free(r);
     skaidb_pool_release(bpool, pc);
     CHECK(skaidb_pool_acquire(bpool, &pc));
     skaidb_pool_release(bpool, pc);
     CHECK(skaidb_pool_members(bpool, &ms));
     m = skaidb_members_get(ms, 0);
-    ASSERT(skaidb_members_len(ms) == 1 && m->in_use == 0 && m->idle == 1);
+    ASSERT(skaidb_members_len(ms) == 1 && m->in_use == 0 && m->idle == 1 && m->latency_ms >= 0);
     skaidb_members_free(ms);
     ASSERT(skaidb_pool_idle_len(bpool) == 1);
     skaidb_pool_free(bpool);

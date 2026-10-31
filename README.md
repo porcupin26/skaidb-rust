@@ -526,9 +526,12 @@ to the pool is closed instead of kept — as is one a transport error left
 broken.
 
 **Latency.** Per member the pool keeps an exponentially weighted average of
-round trips (request sent to first response frame): each sample moves it
-5 % of the way, no sample counts for more than 10 × the larger of the
-average and the ejection floor, and the first sample sets it. One slow
+round trips (request sent to first response frame). The fastest of the
+member's first three round trips seeds it — a round trip is only ever
+lengthened, so a statement that stalls in your own process (a CPU-bound
+start-up) cannot set it — and `PoolMember::latency` is `None` until then.
+After that each sample moves it 5 % of the way, and no sample counts for
+more than 10 × the larger of the average and the ejection floor. One slow
 statement barely moves it; a member that stays slow converges within a few
 dozen statements.
 
