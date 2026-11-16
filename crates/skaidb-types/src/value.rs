@@ -717,6 +717,205 @@ pub fn cmp_i64_f64(i: i64, f: f64) -> Option<Ordering> {
     })
 }
 
+/// Exact comparison of a decimal with a double: the mathematical order of
+/// the two numbers, neither rounded to the other's precision. `None` when
+/// `f` is NaN. (The `=` of a filter compares the pair through the decimal's
+/// nearest double instead, as PostgreSQL does; that relation is not
+/// transitive — two distinct decimals can both equal one double — so a
+/// sort cannot use it.)
+pub fn cmp_decimal_f64(d: Decimal, f: f64) -> Option<Ordering> {
+    if f.is_nan() {
+        return None;
+    }
+    // Every decimal's magnitude is below 2^127 (an `i128` mantissa, a
+    // scale that only shrinks it); -2^127 itself is a mantissa.
+    const TWO_127: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+    if f >= TWO_127 {
+        return Some(Ordering::Less);
+    }
+    if f < -TWO_127 {
+        return Some(Ordering::Greater);
+    }
+    // Whole parts, both truncated toward zero; a double's is exact, and
+    // within `i128` here.
+    let whole_f = f.trunc();
+    let (whole_d, frac_d) = match 10i128.checked_pow(d.scale) {
+        Some(pow) => (d.mantissa / pow, d.mantissa % pow),
+        None => (0, d.mantissa),
+    };
+    match whole_d.cmp(&(whole_f as i128)) {
+        Ordering::Equal => {}
+        other => return Some(other),
+    }
+    // Same whole part: the fractions decide, each carrying its number's
+    // sign. `f - whole_f` is exact.
+    let frac_f = f - whole_f;
+    let sign_f = if frac_f > 0.0 {
+        1
+    } else if frac_f < 0.0 {
+        -1
+    } else {
+        0
+    };
+    let sign_d = frac_d.signum() as i32;
+    if sign_d != sign_f || sign_d == 0 {
+        return Some(sign_d.cmp(&sign_f));
+    }
+    // |frac_d| = r / 10^scale against |frac_f| = m / 2^k, both positive:
+    // r * 2^k against m * 10^scale, in integers wide enough to hold them.
+    let bits = frac_f.abs().to_bits();
+    let exp = ((bits >> 52) & 0x7ff) as u32;
+    let low = bits & ((1u64 << 52) - 1);
+    let (m, k) = if exp == 0 {
+        (low, 1074u32)
+    } else {
+        (low | (1u64 << 52), 1075 - exp)
+    };
+    // A fraction of a double is at least 2^-1074; past this scale the
+    // decimal's (below 2^127 / 10^scale) is smaller than any.
+    const SCALE_BELOW_EVERY_DOUBLE: u32 = 400;
+    let magnitude = if d.scale > SCALE_BELOW_EVERY_DOUBLE {
+        Ordering::Less
+    } else {
+        let mut left = wide::from_u128(frac_d.unsigned_abs());
+        wide::shl(&mut left, k);
+        let mut right = wide::from_u128(u128::from(m));
+        wide::mul_pow10(&mut right, d.scale);
+        wide::cmp(&left, &right)
+    };
+    Some(if sign_d < 0 {
+        magnitude.reverse()
+    } else {
+        magnitude
+    })
+}
+
+/// Unsigned integers of any width, little-endian `u32` limbs with no
+/// leading zero limb — only what [`cmp_decimal_f64`] needs.
+mod wide {
+    use std::cmp::Ordering;
+
+    pub fn from_u128(mut x: u128) -> Vec<u32> {
+        let mut out = Vec::new();
+        while x != 0 {
+            out.push(x as u32);
+            x >>= 32;
+        }
+        out
+    }
+
+    pub fn shl(v: &mut Vec<u32>, bits: u32) {
+        if v.is_empty() {
+            return;
+        }
+        let (limbs, rest) = ((bits / 32) as usize, bits % 32);
+        if rest != 0 {
+            let mut carry = 0u32;
+            for limb in v.iter_mut() {
+                let wide = (u64::from(*limb) << rest) | u64::from(carry);
+                *limb = wide as u32;
+                carry = (wide >> 32) as u32;
+            }
+            if carry != 0 {
+                v.push(carry);
+            }
+        }
+        v.splice(0..0, std::iter::repeat_n(0, limbs));
+    }
+
+    fn mul_small(v: &mut Vec<u32>, by: u32) {
+        let mut carry = 0u64;
+        for limb in v.iter_mut() {
+            let wide = u64::from(*limb) * u64::from(by) + carry;
+            *limb = wide as u32;
+            carry = wide >> 32;
+        }
+        if carry != 0 {
+            v.push(carry as u32);
+        }
+    }
+
+    pub fn mul_pow10(v: &mut Vec<u32>, mut pow: u32) {
+        while pow >= 9 {
+            mul_small(v, 1_000_000_000);
+            pow -= 9;
+        }
+        if pow > 0 {
+            mul_small(v, 10u32.pow(pow));
+        }
+    }
+
+    pub fn cmp(a: &[u32], b: &[u32]) -> Ordering {
+        a.len()
+            .cmp(&b.len())
+            .then_with(|| a.iter().rev().cmp(b.iter().rev()))
+    }
+}
+
+/// The order an `ORDER BY` ranks two non-NULL values in — a total order,
+/// which [`Value::total_cmp`] (the key encoding's: type tag, then value) is
+/// too, but this one is by VALUE where the types are comparable: numbers of
+/// every type (int, float, decimal, timestamp) rank by their exact
+/// mathematical value, a NaN after every number; values of other types
+/// follow by type — bools before numbers, then strings, bytes, uuids,
+/// arrays, documents — each in its own order.
+///
+/// It is deliberately not a filter's comparison: that one also reads an
+/// ISO-8601 string as the timestamp it names and compares a decimal with a
+/// double through the double's precision, and neither relation is
+/// transitive (a timestamp below a date string below `'abc'` below — by
+/// type — the timestamp again). A sort over a comparison like that has no
+/// defined result, and the standard library's aborts when it notices.
+pub fn order_cmp(a: &Value, b: &Value) -> Ordering {
+    fn rank(v: &Value) -> u8 {
+        match v {
+            Value::Null => 0,
+            Value::Bool(_) => 1,
+            Value::Int(_) | Value::Float(_) | Value::Decimal(_) | Value::Timestamp(_) => 2,
+            Value::String(_) => 3,
+            Value::Bytes(_) => 4,
+            Value::Uuid(_) => 5,
+            Value::Array(_) => 6,
+            Value::Document(_) => 7,
+        }
+    }
+    match rank(a).cmp(&rank(b)) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+    // A NaN ranks after every number, and with another NaN.
+    let nan = |v: &Value| matches!(v, Value::Float(f) if f.is_nan());
+    match (nan(a), nan(b)) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Greater,
+        (false, true) => return Ordering::Less,
+        (false, false) => {}
+    }
+    match (a, b) {
+        (Value::Int(x) | Value::Timestamp(x), Value::Int(y) | Value::Timestamp(y)) => x.cmp(y),
+        (Value::Int(x) | Value::Timestamp(x), Value::Float(f)) => {
+            cmp_i64_f64(*x, *f).unwrap_or(Ordering::Equal)
+        }
+        (Value::Float(f), Value::Int(y) | Value::Timestamp(y)) => {
+            cmp_i64_f64(*y, *f).unwrap_or(Ordering::Equal).reverse()
+        }
+        (Value::Int(x) | Value::Timestamp(x), Value::Decimal(d)) => cmp_i64_decimal(*x, *d),
+        (Value::Decimal(d), Value::Int(y) | Value::Timestamp(y)) => cmp_i64_decimal(*y, *d).reverse(),
+        (Value::Decimal(x), Value::Decimal(y)) => cmp_decimal(*x, *y),
+        (Value::Decimal(d), Value::Float(f)) => cmp_decimal_f64(*d, *f).unwrap_or(Ordering::Equal),
+        (Value::Float(f), Value::Decimal(d)) => {
+            cmp_decimal_f64(*d, *f).unwrap_or(Ordering::Equal).reverse()
+        }
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::String(x), Value::String(y)) => x.cmp(y),
+        (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
+        (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
+        // NULLs, arrays, documents: the key encoding's order.
+        _ => a.total_cmp(b),
+    }
+}
+
 /// Whether `i` is exactly representable as an `f64` (so `i as f64` loses
 /// nothing and some double can equal it).
 pub fn i64_is_exact_f64(i: i64) -> bool {
@@ -908,6 +1107,197 @@ mod tests {
             Value::Document(Document::new()),
         ];
         assert!(order.windows(2).all(|w| key_tag(&w[0]) < key_tag(&w[1])));
+    }
+
+    #[test]
+    fn a_decimal_and_a_double_compare_exactly() {
+        use Ordering::*;
+        let dec = Decimal::new;
+        // 0.1 as a double is a little above one tenth, 0.3 a little below
+        // three tenths; the halves are exact.
+        assert_eq!(cmp_decimal_f64(dec(1, 1), 0.1), Some(Less));
+        assert_eq!(cmp_decimal_f64(dec(10, 2), 0.1), Some(Less));
+        assert_eq!(cmp_decimal_f64(dec(3, 1), 0.3), Some(Greater));
+        assert_eq!(cmp_decimal_f64(dec(5, 1), 0.5), Some(Equal));
+        assert_eq!(cmp_decimal_f64(dec(25, 2), 0.25), Some(Equal));
+        assert_eq!(cmp_decimal_f64(dec(-5, 1), -0.5), Some(Equal));
+        assert_eq!(cmp_decimal_f64(dec(-1, 1), -0.1), Some(Greater));
+        assert_eq!(cmp_decimal_f64(dec(-3, 1), -0.3), Some(Less));
+        // 2^-20 = 0.00000095367431640625 exactly, twenty digits.
+        let tiny = 2f64.powi(-20);
+        assert_eq!(cmp_decimal_f64(dec(95_367_431_640_625, 20), tiny), Some(Equal));
+        assert_eq!(cmp_decimal_f64(dec(95_367_431_640_624, 20), tiny), Some(Less));
+        assert_eq!(cmp_decimal_f64(dec(95_367_431_640_626, 20), tiny), Some(Greater));
+        assert_eq!(cmp_decimal_f64(dec(-95_367_431_640_626, 20), -tiny), Some(Less));
+        let beside = dec(100_000_000_000_095_367_431_640_625, 20); // 1000000 + 2^-20
+        assert_eq!(cmp_decimal_f64(beside, 1_000_000.0 + tiny), Some(Equal));
+        assert_eq!(cmp_decimal_f64(beside, 1_000_000.0), Some(Greater));
+        // Whole parts decide first, on either side of zero.
+        assert_eq!(cmp_decimal_f64(dec(19, 1), 2.1), Some(Less));
+        assert_eq!(cmp_decimal_f64(dec(-19, 1), -2.1), Some(Greater));
+        assert_eq!(cmp_decimal_f64(dec(5, 1), -0.5), Some(Greater));
+        assert_eq!(cmp_decimal_f64(dec(-5, 1), 0.5), Some(Less));
+        assert_eq!(cmp_decimal_f64(dec(0, 3), 0.0), Some(Equal));
+        assert_eq!(cmp_decimal_f64(dec(0, 3), -0.0), Some(Equal));
+        // Past 2^53 a double stands for one integer; the decimal next to it
+        // is still another number.
+        let two53 = 9_007_199_254_740_992i128;
+        assert_eq!(cmp_decimal_f64(dec(two53 + 1, 0), two53 as f64), Some(Greater));
+        assert_eq!(cmp_decimal_f64(dec(two53 * 10 + 5, 1), two53 as f64), Some(Greater));
+        assert_eq!(cmp_decimal_f64(dec(two53, 0), two53 as f64), Some(Equal));
+        // The ends of the mantissa, and of the doubles.
+        let two127 = 2f64.powi(127);
+        assert_eq!(cmp_decimal_f64(dec(i128::MAX, 0), two127), Some(Less));
+        assert_eq!(cmp_decimal_f64(dec(i128::MIN, 0), -two127), Some(Equal));
+        assert_eq!(cmp_decimal_f64(dec(i128::MIN, 0), -two127 * 2.0), Some(Greater));
+        assert_eq!(cmp_decimal_f64(dec(1, 0), f64::INFINITY), Some(Less));
+        assert_eq!(cmp_decimal_f64(dec(1, 0), f64::NEG_INFINITY), Some(Greater));
+        assert_eq!(cmp_decimal_f64(dec(1, 0), f64::NAN), None);
+        // The smallest double is 4.94065645841246544…e-324.
+        let least = f64::from_bits(1);
+        assert_eq!(cmp_decimal_f64(dec(49_406_564_584_124_654, 340), least), Some(Less));
+        assert_eq!(cmp_decimal_f64(dec(49_406_564_584_124_655, 340), least), Some(Greater));
+        assert_eq!(cmp_decimal_f64(dec(1, 1_000), least), Some(Less));
+        assert_eq!(cmp_decimal_f64(dec(1, 1_000), 0.0), Some(Greater));
+        assert_eq!(cmp_decimal_f64(dec(-1, 4_000_000_000), -least), Some(Greater));
+        // 2^127 / 10^361 is still above it, / 10^362 below.
+        assert_eq!(cmp_decimal_f64(dec(i128::MAX, 361), least), Some(Greater));
+        assert_eq!(cmp_decimal_f64(dec(i128::MAX, 362), least), Some(Less));
+        assert_eq!(cmp_decimal_f64(dec(i128::MAX, 400), least), Some(Less));
+        assert_eq!(cmp_decimal_f64(dec(i128::MAX, 401), least), Some(Less));
+    }
+
+    /// Values a sort may meet in one column of a schema-less table.
+    fn sortable_pool() -> Vec<Value> {
+        let two53 = 9_007_199_254_740_992i64;
+        let ts = 1_700_000_005_000i64;
+        let mut pool = vec![Value::Bool(false), Value::Bool(true)];
+        for i in [i64::MIN, -two53 - 1, -1, 0, 1, 2, two53, two53 + 1, ts, ts + 1, i64::MAX] {
+            pool.push(Value::Int(i));
+            pool.push(Value::Timestamp(i));
+        }
+        for f in [
+            f64::NEG_INFINITY,
+            -(two53 as f64),
+            -0.5,
+            -0.0,
+            0.0,
+            f64::from_bits(1),
+            0.1,
+            0.3,
+            0.5,
+            1.0,
+            1.5,
+            two53 as f64,
+            ts as f64 + 0.5,
+            1e300,
+            f64::INFINITY,
+            f64::NAN,
+        ] {
+            pool.push(Value::Float(f));
+        }
+        for (m, s) in [
+            (0i128, 0u32),
+            (1, 1),
+            (10, 2),
+            (1_000_000_000_000_000_001, 19),
+            (3, 1),
+            (5, 1),
+            (15, 1),
+            (i128::from(two53) + 1, 0),
+            (i128::from(two53) * 10 + 5, 1),
+            (i128::from(ts) * 10 + 5, 1),
+            (1, 1_000),
+            (-1, 1_000),
+            (i128::MAX, 0),
+            (i128::MIN, 0),
+        ] {
+            pool.push(Value::Decimal(Decimal::new(m, s)));
+        }
+        for s in ["", "2023-11-14", "2023-11-14T22:13:25Z", "2024-01-01T00:00:00Z", "abc", "zzz"] {
+            pool.push(Value::String(s.into()));
+        }
+        pool.push(Value::Bytes(vec![]));
+        pool.push(Value::Bytes(vec![0, 1]));
+        pool.push(Value::Uuid(Uuid([0u8; 16])));
+        pool.push(Value::Uuid(Uuid([7u8; 16])));
+        pool.push(Value::Array(vec![]));
+        pool.push(Value::Array(vec![Value::Int(1), Value::String("a".into())]));
+        let mut doc = Document::new();
+        doc.insert("a", Value::Int(1));
+        pool.push(Value::Document(Document::new()));
+        pool.push(Value::Document(doc));
+        pool
+    }
+
+    /// `order_cmp` is a total order over everything a column can hold:
+    /// antisymmetric and transitive for every triple, which is what a sort
+    /// needs to have a result at all.
+    #[test]
+    fn the_sort_order_is_total() {
+        use Ordering::*;
+        let pool = sortable_pool();
+        for a in &pool {
+            assert_eq!(order_cmp(a, a), Equal, "{a:?}");
+            for b in &pool {
+                let ab = order_cmp(a, b);
+                assert_eq!(ab, order_cmp(b, a).reverse(), "{a:?} / {b:?}");
+                for c in &pool {
+                    let (bc, ac) = (order_cmp(b, c), order_cmp(a, c));
+                    if ab != Greater && bc != Greater {
+                        assert_ne!(ac, Greater, "{a:?} <= {b:?} <= {c:?}");
+                        if ab == Less || bc == Less {
+                            assert_eq!(ac, Less, "{a:?} <= {b:?} <= {c:?}, one strictly");
+                        }
+                    }
+                }
+            }
+        }
+        // And the sort itself: every rotation of the pool sorts to one
+        // sequence (up to ties) without the library objecting.
+        let mut want = pool.clone();
+        want.sort_by(order_cmp);
+        for shift in 0..pool.len() {
+            let mut got = pool.clone();
+            got.rotate_left(shift);
+            got.reverse();
+            got.sort_by(order_cmp);
+            for (g, w) in got.iter().zip(&want) {
+                assert_eq!(order_cmp(g, w), Equal, "rotation {shift}: {g:?} where {w:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_sort_order_ranks_numbers_by_value_and_other_types_after() {
+        use Ordering::*;
+        let dec = |m: i128, s: u32| Value::Decimal(Decimal::new(m, s));
+        let s = |x: &str| Value::String(x.into());
+        // One number in four types ties; neighbours do not.
+        for one in [Value::Int(1), Value::Timestamp(1), Value::Float(1.0), dec(10, 1)] {
+            assert_eq!(order_cmp(&one, &Value::Int(1)), Equal, "{one:?}");
+            assert_eq!(order_cmp(&one, &Value::Float(1.5)), Less, "{one:?}");
+            assert_eq!(order_cmp(&one, &dec(5, 1)), Greater, "{one:?}");
+        }
+        // A decimal and the double nearest to it are two numbers.
+        assert_eq!(order_cmp(&dec(1, 1), &Value::Float(0.1)), Less);
+        assert_eq!(order_cmp(&dec(1, 1), &dec(1_000_000_000_000_000_001, 19)), Less);
+        // Bools, then every number, then strings — a timestamp is a
+        // number, whatever a string spells.
+        let ts = Value::Timestamp(1_700_000_005_000);
+        assert_eq!(order_cmp(&Value::Bool(true), &Value::Int(i64::MIN)), Less);
+        assert_eq!(order_cmp(&ts, &s("2023-11-14T22:13:25Z")), Less);
+        assert_eq!(order_cmp(&ts, &s("1999-01-01")), Less);
+        assert_eq!(order_cmp(&ts, &s("abc")), Less);
+        assert_eq!(order_cmp(&Value::Float(f64::INFINITY), &s("")), Less);
+        assert_eq!(order_cmp(&Value::Float(f64::NAN), &Value::Float(f64::INFINITY)), Greater);
+        assert_eq!(order_cmp(&Value::Float(f64::NAN), &s("")), Less);
+        // Strings as strings, then bytes, uuids, arrays, documents.
+        assert_eq!(order_cmp(&s("2024-01-01T00:00:00Z"), &s("abc")), Less);
+        assert_eq!(order_cmp(&s("zzz"), &Value::Bytes(vec![])), Less);
+        assert_eq!(order_cmp(&Value::Bytes(vec![9]), &Value::Uuid(Uuid([0u8; 16]))), Less);
+        assert_eq!(order_cmp(&Value::Uuid(Uuid([9u8; 16])), &Value::Array(vec![])), Less);
+        assert_eq!(order_cmp(&Value::Array(vec![]), &Value::Document(Document::new())), Less);
     }
 
     #[test]

@@ -94,6 +94,30 @@ pub struct Prepared {
     /// How many `?` parameters the statement expects.
     pub params: u16,
     sql: String,
+    /// The connection that issued `id` ([`Client::connection`]). An id is
+    /// an index there and nowhere else: on another connection it is
+    /// unknown, or names whatever statement was prepared there under it.
+    connection: u64,
+    /// Which PREPARE on that connection issued `id` ([`next_serial`]). The
+    /// server gives a closed statement's id to the next one prepared, so
+    /// the connection alone does not say the id is still this statement's:
+    /// a copy of a handle that has been closed carries an id that may by
+    /// now be another statement's.
+    serial: u64,
+}
+
+/// One number per connection this process has opened, and one per
+/// statement it has prepared, never reused: what tells a prepared
+/// statement's connection from the one that replaced it, and its id from
+/// the same id issued again.
+static SERIALS: AtomicU64 = AtomicU64::new(1);
+
+fn next_serial() -> u64 {
+    SERIALS.fetch_add(1, Ordering::Relaxed)
+}
+
+fn next_connection() -> u64 {
+    next_serial()
 }
 
 /// A synchronous connection to a skaidb cluster, with failover across endpoints.
@@ -116,9 +140,26 @@ pub struct Client {
     /// Client-TLS settings applied to every (re)connect; `None` = plaintext.
     tls: Option<TlsConfig>,
     default_consistency: Consistency,
+    /// Which connection `stream` is ([`next_connection`]): changes with
+    /// every reconnect, so a [`Prepared`] can tell that its id is from a
+    /// connection that is gone.
+    connection: u64,
+    /// The statements prepared on this connection and not closed: id →
+    /// the serial of the PREPARE that issued it (see `Prepared::serial`).
+    statements: HashMap<u32, u64>,
+    /// The id this connection last prepared each statement text under,
+    /// while it is live — what a handle from ANOTHER connection is given
+    /// when it comes (back) to this one, instead of one more place in the
+    /// server's table at every visit.
+    by_text: HashMap<String, u32>,
     /// Session database, re-applied after every reconnect (see
     /// [`Client::with_database`]). `None` leaves the server default.
     database: Option<String>,
+    /// For a pooled connection: the session database its pool hands it
+    /// out in (`Some(None)` = none). A borrower's `USE` moves `database`;
+    /// the pool puts the connection back before the next borrower gets it
+    /// ([`Client::back_home`]).
+    home: Option<Option<String>>,
     /// Session scan-budget ROWS override, replayed on reconnect like the
     /// database (`0` = none). Tightening-only server-side, so replaying it
     /// can never widen anything.
@@ -345,7 +386,11 @@ impl Client {
                         stream,
                         tls: login.tls.clone(),
                         default_consistency: Consistency::Quorum,
+                        connection: next_connection(),
+                        statements: HashMap::new(),
+                        by_text: HashMap::new(),
                         database: None,
+                        home: None,
                         scan_budget_rows: 0,
                         link,
                         in_transaction: false,
@@ -479,6 +524,29 @@ impl Client {
     /// The session database, if one was bound.
     pub fn database(&self) -> Option<&str> {
         self.database.as_deref()
+    }
+
+    /// A connection a pool hands out is in the pool's database for every
+    /// borrower: this one was just made (or configured) by its pool, and
+    /// whatever database it is in now is where it goes back to.
+    fn pooled_here(mut self) -> Client {
+        self.home = Some(self.database.clone());
+        self
+    }
+
+    /// Put a pooled connection back into the database its pool hands it
+    /// out in, after a borrower that entered another (`USE other`, or
+    /// `use_database`) — which this client would otherwise keep, through
+    /// reconnects too, for whoever borrows it next. `false`: it could not
+    /// be put back (the `USE` failed, or the pool's connections are in no
+    /// database, which a session cannot return to) and the pool drops it.
+    fn back_home(&mut self) -> bool {
+        match self.home.clone() {
+            None => true,
+            Some(home) if home == self.database => true,
+            Some(Some(db)) => self.use_database(&db).is_ok(),
+            Some(None) => false,
+        }
     }
 
     /// Issue `USE` for the bound database on the CURRENT connection. Sends
@@ -787,15 +855,81 @@ impl Client {
             other => other,
         }
         .and_then(|resp| match resp {
-            Response::Prepared { id, params } => Ok(Prepared {
-                id,
-                params,
-                sql: sql.to_string(),
-            }),
+            Response::Prepared { id, params } => {
+                let serial = next_serial();
+                self.statements.insert(id, serial);
+                self.by_text.insert(sql.to_string(), id);
+                Ok(Prepared {
+                    id,
+                    params,
+                    sql: sql.to_string(),
+                    // After the round trip: a reconnect inside it issued the id.
+                    connection: self.connection,
+                    serial,
+                })
+            }
             other => Err(DriverError::Server(format!(
                 "unexpected response to Prepare: {other:?}"
             ))),
         })
+    }
+
+    /// Release a prepared statement on the server, where a connection
+    /// holds a bounded number of them (256): an application that prepares
+    /// as it goes closes what it is done with, or the server refuses the
+    /// next `prepare` once the table is full. A statement that is no
+    /// longer this connection's — its connection has been replaced, or the
+    /// statement was closed through another copy of the handle — has
+    /// nothing to release; one lost with the connection during this call
+    /// likewise. Copies of the handle stay usable: they are prepared again
+    /// when next executed.
+    pub fn close_prepared(&mut self, stmt: Prepared) -> Result<(), DriverError> {
+        if !self.holds(&stmt) {
+            return Ok(());
+        }
+        self.statements.remove(&stmt.id);
+        if self.by_text.get(&stmt.sql) == Some(&stmt.id) {
+            self.by_text.remove(&stmt.sql);
+        }
+        match self.roundtrip(&ClientRequest::Close { id: stmt.id }) {
+            Ok(_) | Err(DriverError::Io(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether `stmt`'s id is, on the current connection, still the
+    /// statement the handle was given it for.
+    fn holds(&self, stmt: &Prepared) -> bool {
+        stmt.connection == self.connection && self.statements.get(&stmt.id) == Some(&stmt.serial)
+    }
+
+    /// `stmt`'s id on the CURRENT connection. A handle is sent as it is
+    /// only while this connection still holds its statement under that id
+    /// ([`Client::holds`]); otherwise the id is not the statement's here —
+    /// the connection was replaced (under any statement: the handle was
+    /// not part of that call), the handle is from another client, or the
+    /// statement was closed through a copy and its id given to another —
+    /// and sending it would be an unknown id or, worse, another statement
+    /// run with this one's parameters. Then the handle takes the id this
+    /// connection already has for its text, or the statement is prepared
+    /// here.
+    fn live_statement(&mut self, stmt: &mut Prepared) -> Result<u32, DriverError> {
+        if self.holds(stmt) {
+            return Ok(stmt.id);
+        }
+        let known = self
+            .by_text
+            .get(&stmt.sql)
+            .and_then(|id| self.statements.get(id).map(|serial| (*id, *serial)));
+        match known {
+            Some((id, serial)) => {
+                stmt.id = id;
+                stmt.serial = serial;
+                stmt.connection = self.connection;
+            }
+            None => *stmt = self.prepare(&stmt.sql)?,
+        }
+        Ok(stmt.id)
     }
 
     /// Execute a prepared statement at the default consistency.
@@ -808,8 +942,10 @@ impl Client {
     }
 
     /// Execute a prepared statement at an explicit consistency. Prepared ids
-    /// are per-connection, so on failover the statement is transparently
-    /// re-prepared on the new connection (updating `stmt`) and retried once.
+    /// are per-connection, so a handle from a connection that has been
+    /// replaced — under this call or any earlier one — is transparently
+    /// re-prepared on the current connection (updating `stmt`); a failover
+    /// under this call retries once.
     pub fn execute_prepared_with(
         &mut self,
         stmt: &mut Prepared,
@@ -817,7 +953,7 @@ impl Client {
         consistency: Consistency,
     ) -> Result<Response, DriverError> {
         let req = ClientRequest::Execute {
-            id: stmt.id,
+            id: self.live_statement(stmt)?,
             params: params.to_vec(),
             consistency,
         };
@@ -851,7 +987,7 @@ impl Client {
     ) -> Result<u64, DriverError> {
         let consistency = self.default_consistency;
         let req = ClientRequest::ExecuteBatch {
-            id: stmt.id,
+            id: self.live_statement(stmt)?,
             rows: rows.clone(),
             consistency,
         };
@@ -923,8 +1059,17 @@ impl Client {
     }
 
     /// A statement succeeded: a pool with read-your-writes on remembers
-    /// which member took a write.
-    fn observe_statement(&self, sql: &str) {
+    /// which member took a write, and a `USE` binds the session database
+    /// exactly as [`Client::use_database`] does — the connection that
+    /// replaces this one re-enters it. Sent as a plain statement it used to
+    /// be the server's knowledge alone: after a failover the session was
+    /// back in no database, and the next statement ran against whatever
+    /// table of that name the default database held (or was refused for
+    /// it), with nothing to say the connection had changed.
+    fn observe_statement(&mut self, sql: &str) {
+        if let Some(database) = used_database(sql) {
+            self.database = Some(database);
+        }
         if let Some(link) = &self.link {
             if link.out && link.pool.read_your_writes() && is_write(sql) {
                 link.pool.wrote(link.affinity.clone(), &self.connected);
@@ -1106,6 +1251,9 @@ impl Client {
             ) {
                 Ok(stream) => {
                     self.stream = stream;
+                    self.connection = next_connection();
+                    self.statements.clear();
+                    self.by_text.clear();
                     self.connected = ep.clone();
                     self.endpoints = ordered;
                     if let Some(link) = &mut self.link {
@@ -1625,7 +1773,7 @@ impl Pool {
                     .pop();
                 match reused {
                     Some(c) => Ok(c),
-                    None => make(),
+                    None => make().map(Client::pooled_here),
                 }
             }
             PoolInner::Balanced(b) => b.checkout(None),
@@ -1655,11 +1803,13 @@ impl Pool {
     /// balanced pool also drops a connection a transport error left broken,
     /// one whose member is ejected, not `ready` or gone, and one it did not
     /// hand out.
-    pub fn release(&self, client: Client) {
+    pub fn release(&self, mut client: Client) {
         match &self.inner {
             PoolInner::Factory { maxsize, idle, closed, .. } => {
                 let closed = closed.lock().map(|c| *c).unwrap_or(true);
-                if closed {
+                // (A connection its borrower left in another database goes
+                // back into the pool's own, or is dropped.)
+                if closed || !client.back_home() {
                     return;
                 }
                 if let Ok(mut idle) = idle.lock() {
@@ -2183,6 +2333,70 @@ const CHECKOUT_ATTEMPTS: usize = 3;
 /// keeps the caller on its member a little longer).
 const READ_KEYWORDS: [&str; 8] = ["select", "show", "explain", "describe", "desc", "values", "with", "use"];
 
+/// The database a `USE [DATABASE] <name>` statement names, when `sql` is
+/// exactly one such statement (a trailing `;` allowed): the name as
+/// written, or with its double quotes removed and doubled quotes inside
+/// undone. `None` for anything else.
+fn used_database(sql: &str) -> Option<String> {
+    let sql = without_line_comments(sql);
+    let rest = sql.trim().trim_end_matches(';').trim_end();
+    let rest = strip_keyword(rest, "USE")?;
+    let rest = strip_keyword(rest, "DATABASE").unwrap_or(rest);
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let inner = quoted.strip_suffix('"')?;
+        // A lone quote inside would end the name early: not one name.
+        if inner.replace("\"\"", "").contains('"') || inner.is_empty() {
+            return None;
+        }
+        return Some(inner.replace("\"\"", "\""));
+    }
+    let bare = !rest.is_empty() && rest.chars().all(|c| c.is_alphanumeric() || c == '_');
+    bare.then(|| rest.to_string())
+}
+
+/// `sql` without its `--` comments (each runs to the end of its line),
+/// leaving alone a `--` inside a double-quoted name or a quoted string.
+/// The server accepts `USE app -- the app database`, and a `USE` the
+/// driver cannot read is one it does not carry to the next connection.
+fn without_line_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut quote: Option<char> = None;
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                out.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None if c == '-' && chars.peek() == Some(&'-') => {
+                for skipped in chars.by_ref() {
+                    if skipped == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            None => {
+                out.push(c);
+                if c == '"' || c == '\'' {
+                    quote = Some(c);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `text` after the leading keyword `word` (any case) and the whitespace
+/// that must follow it.
+fn strip_keyword<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+    let head = text.get(..word.len())?;
+    let tail = &text[word.len()..];
+    (head.eq_ignore_ascii_case(word) && tail.starts_with(char::is_whitespace)).then(|| tail.trim_start())
+}
+
 /// Whether `sql` counts as a write: its first keyword, after whitespace,
 /// `--` / `/* */` comments and opening parentheses, is not a read keyword.
 fn is_write(sql: &str) -> bool {
@@ -2416,9 +2630,12 @@ impl Balancer {
     }
 
     fn checkin(&self, mut client: Client) {
+        // Before the lock (it may send a `USE`): back in the pool's
+        // database, whatever the borrower entered.
+        let home = client.back_home();
         let mut guard = self.lock();
         let st = &mut *guard;
-        let keep = match client.link.as_mut() {
+        let keep = home && match client.link.as_mut() {
             Some(link) if std::ptr::eq(Arc::as_ptr(&link.pool), self) => {
                 let usable = match st.members.get_mut(&link.member) {
                     Some(m) => {
@@ -2610,7 +2827,7 @@ impl Balancer {
         if let Some(db) = &self.database {
             client.use_database(db)?;
         }
-        Ok(client)
+        Ok(if pooled { client.pooled_here() } else { client })
     }
 
     // -- what connections report (any thread) --
@@ -3014,6 +3231,36 @@ impl Rng {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `USE` sent as a statement is what the next connection re-enters.
+    #[test]
+    fn a_use_statement_names_the_session_database() {
+        for (sql, want) in [
+            ("USE app", Some("app")),
+            ("use app;", Some("app")),
+            ("  USE\n  DATABASE app_2 ;\n", Some("app_2")),
+            ("USE \"my db\"", Some("my db")),
+            ("USE DATABASE \"a\"\"b\"", Some("a\"b")),
+            // A comment the server skips.
+            ("USE app -- the app database", Some("app")),
+            ("-- first\nUSE app;  -- then\n", Some("app")),
+            ("USE \"a--b\" -- named with dashes", Some("a--b")),
+            ("USE -- nothing", None),
+            ("-- USE app", None),
+            // A database named `database`, as the server reads it.
+            ("USE DATABASE", Some("DATABASE")),
+            ("USE DATABASE DATABASE", Some("DATABASE")),
+            ("USE", None),
+            ("USEFUL app", None),
+            ("USE app; SELECT 1", None),
+            ("USE \"a\"b\"", None),
+            ("USE \"\"", None),
+            ("SELECT 'USE app'", None),
+            ("INSERT INTO t (id) VALUES (1)", None),
+        ] {
+            assert_eq!(used_database(sql).as_deref(), want, "{sql:?}");
+        }
+    }
 
     #[test]
     fn dedup_keeps_first_occurrence_order() {

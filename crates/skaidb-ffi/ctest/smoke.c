@@ -144,7 +144,18 @@ int main(void) {
     ASSERT(n == 3);
     for (int i = 0; i < 3; i++)
         for (int j = 0; j < 8; j++) skaidb_value_free(batch[i][j]);
-    skaidb_prepared_free(ins);
+    /* Released on the server too: a connection holds 256 of them, and a
+     * program that prepares as it goes passes far more through. */
+    CHECK(skaidb_prepared_close(c, ins));
+    for (int i = 0; i < 300; i++) {
+        char sql[96];
+        snprintf(sql, sizeof sql, "UPDATE cffi_smoke SET score = ? WHERE id = %d", 1000 + i);
+        skaidb_prepared_t *st = NULL;
+        CHECK(skaidb_prepare(c, sql, &st));
+        ASSERT(skaidb_prepared_params(st) == 1);
+        CHECK(skaidb_prepared_close(c, st));
+    }
+    ASSERT(skaidb_prepared_close(c, NULL) == SKAIDB_ERR_INVALID);
 
     /* Read back with every accessor. */
     CHECK(skaidb_execute(c, "SELECT id, name, score, ok, ts, tags, doc, nothing FROM cffi_smoke ORDER BY id", &r));

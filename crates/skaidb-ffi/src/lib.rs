@@ -703,6 +703,28 @@ pub unsafe extern "C" fn skaidb_prepared_free(stmt: *mut skaidb_prepared) {
     }
 }
 
+/// Release `stmt` on the server and free the handle, whatever the outcome
+/// (a connection holds a bounded number of prepared statements;
+/// `skaidb_prepared_free` frees the handle alone and leaves the server's
+/// entry to the end of the connection).
+#[no_mangle]
+pub unsafe extern "C" fn skaidb_prepared_close(
+    client: *mut skaidb_client,
+    stmt: *mut skaidb_prepared,
+) -> skaidb_status {
+    if stmt.is_null() {
+        return fail(SKAIDB_ERR_INVALID, "stmt is NULL");
+    }
+    let stmt = Box::from_raw(stmt);
+    match client_mut(client) {
+        Ok(c) => match c.close_prepared(stmt.0) {
+            Ok(()) => SKAIDB_OK,
+            Err(e) => fail_driver(e),
+        },
+        Err(s) => s,
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn skaidb_execute_prepared(
     client: *mut skaidb_client,

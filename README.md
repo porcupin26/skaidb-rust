@@ -23,7 +23,7 @@ is tested with:
 
 ```toml
 [dependencies]
-skaidb = "0.347"
+skaidb = "0.348"
 ```
 
 Kerberos (GSSAPI) logins are behind the `kerberos` feature, which links the
@@ -32,7 +32,7 @@ MIT krb5 library through `cross-krb5`. Install the development headers first
 macOS and Windows) and enable the feature:
 
 ```toml
-skaidb = { version = "0.347", features = ["kerberos"] }
+skaidb = { version = "0.348", features = ["kerberos"] }
 ```
 
 The feature is off by default and never builds on static musl targets.
@@ -117,7 +117,9 @@ impl Client {
                               tls: Option<TlsConfig>) -> Result<Client, DriverError>;
 
     /// Bind the session to a database: runs `USE` now and after every reconnect.
+    /// A `USE <db>` sent through `execute` binds it the same way.
     pub fn with_database(self, database: &str) -> Result<Client, DriverError>;
+    pub fn use_database(&mut self, database: &str) -> Result<(), DriverError>;
     pub fn database(&self) -> Option<&str>;
 
     /// The endpoint the live connection uses; all candidates in preference order.
@@ -142,7 +144,9 @@ leaderless, so any member serves any statement.
 
 When a statement hits a transport error (broken pipe, reset, EOF) the
 driver dials another endpoint, re-authenticates, re-sends its `Hello`,
-re-enters the bound database, re-applies the scan budget and **retries the
+re-enters the bound database — the one given to `with_database` /
+`use_database`, or entered by a `USE <db>` statement sent through
+`execute` — re-applies the scan budget and **retries the
 statement once**. This is transparent, and it means a non-idempotent
 statement can run twice if the node died after applying it but before
 answering. `reconnect()` does the same on demand, for a pool or a caller
@@ -251,6 +255,7 @@ impl Client {
     pub fn execute_prepared_with(&mut self, stmt: &mut Prepared, params: &[Value], consistency: Consistency)
         -> Result<Response, DriverError>;
     pub fn execute_batch(&mut self, stmt: &mut Prepared, rows: Vec<Vec<Value>>) -> Result<u64, DriverError>;
+    pub fn close_prepared(&mut self, stmt: Prepared) -> Result<(), DriverError>;
 }
 ```
 
@@ -267,10 +272,19 @@ if let Response::Mutation { affected } = client.execute_prepared(&mut upd, &[Val
 }
 ```
 
-A handle is valid only on the connection that created it. That is why the
-calls take `&mut Prepared`: when a failover happens mid-call, the driver
-re-prepares the template on the new connection, updates the handle in
-place and retries once, so callers never see a stale id.
+A handle is valid only on the connection that created it, and it knows
+which one that was. That is why the calls take `&mut Prepared`: when the
+connection has been replaced — by a failover under this call, or under any
+statement since the handle was last used — the driver prepares the
+template again on the current connection and updates the handle in place
+before it sends anything, so a stale id never reaches the server (where it
+would be unknown, or the id of another statement prepared since).
+
+A connection holds at most 256 prepared statements on the server. A
+program that prepares a fixed set once never notices; one that prepares
+statements as it goes releases each with `close_prepared` when it is done
+with it, or the server refuses the 257th `prepare` (`too many prepared
+statements`). Dropping a `Prepared` frees nothing on the server.
 
 `execute_batch` runs one prepared statement once per parameter row in a
 single round trip (the `executemany` wire op) and returns the total

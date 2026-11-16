@@ -60,6 +60,14 @@ int main() {
         rows.push_back({i, "n" + std::to_string(i), i * 1.0, false, skaidb::Value::timestamp(0),
                         skaidb::Value::array({}), skaidb::Value::document({})});
     ASSERT(c.execute_batch(ins, rows) == 3);
+    // Closed, a statement gives its place on the server back (256 a
+    // connection): three hundred pass through one.
+    c.close(std::move(ins));
+    for (int i = 0; i < 300; ++i) {
+        auto st = c.prepare("UPDATE cppffi_smoke SET score = ? WHERE id = " + std::to_string(1000 + i));
+        ASSERT(st.params() == 1);
+        c.close(std::move(st));
+    }
 
     // Read back: range-for, indexing, accessors.
     auto sel = c.execute("SELECT id, name, score, ok, ts, tags, doc FROM cppffi_smoke ORDER BY id");

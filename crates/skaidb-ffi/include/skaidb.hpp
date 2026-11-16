@@ -503,6 +503,8 @@ public:
     explicit Prepared(skaidb_prepared_t *p) : p_(p) {}
     std::size_t params() const noexcept { return skaidb_prepared_params(p_.get()); }
     skaidb_prepared_t *raw() const noexcept { return p_.get(); }
+    /* Gives the handle up (for Client::close). */
+    skaidb_prepared_t *release() noexcept { return p_.release(); }
 
 private:
     std::unique_ptr<skaidb_prepared_t, detail::PreparedDeleter> p_;
@@ -690,6 +692,10 @@ public:
         detail::check(skaidb_prepare(p_.get(), sql.c_str(), &p));
         return Prepared(p);
     }
+    /* Release a prepared statement on the server (a connection holds at
+     * most 256). A Prepared that is merely destroyed frees its handle and
+     * leaves the server's entry to the end of the connection. */
+    void close(Prepared stmt) { detail::check(skaidb_prepared_close(p_.get(), stmt.release())); }
     Result execute(Prepared &stmt, const std::vector<Value> &params) {
         auto ps = param_ptrs(params);
         skaidb_result_t *r = nullptr;

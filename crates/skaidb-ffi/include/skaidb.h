@@ -191,9 +191,19 @@ skaidb_status_t skaidb_execute_with(skaidb_client_t *client, const char *sql,
                                     skaidb_consistency_t consistency, skaidb_result_t **out);
 
 /* Server-side prepared statement (placeholders are `?`, positional). The
- * handle survives failover: the driver re-prepares transparently. */
+ * handle survives failover: the driver re-prepares it on the connection
+ * that replaced the one it was prepared on, whichever statement the
+ * failover happened under.
+ *
+ * A connection holds at most 256 prepared statements on the server.
+ * skaidb_prepared_close releases the statement there and frees the handle
+ * (always, also when it returns an error); skaidb_prepared_free frees the
+ * handle alone, and the server keeps its entry until the connection ends —
+ * fine for statements prepared once and kept, not for a program that
+ * prepares as it goes. */
 skaidb_status_t skaidb_prepare(skaidb_client_t *client, const char *sql, skaidb_prepared_t **out);
 size_t skaidb_prepared_params(const skaidb_prepared_t *stmt);
+skaidb_status_t skaidb_prepared_close(skaidb_client_t *client, skaidb_prepared_t *stmt);
 void skaidb_prepared_free(skaidb_prepared_t *stmt);
 
 skaidb_status_t skaidb_execute_prepared(skaidb_client_t *client, skaidb_prepared_t *stmt,
