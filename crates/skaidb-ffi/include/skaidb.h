@@ -144,6 +144,45 @@ skaidb_status_t skaidb_client_add_endpoints(skaidb_client_t *client,
 /* Drop the live connection and dial another node. */
 skaidb_status_t skaidb_client_reconnect(skaidb_client_t *client);
 
+/* ---- transactions ----------------------------------------------------- */
+
+/* A transaction is SQL on ONE connection: an opening statement (BEGIN on a
+ * standalone server; BEGIN ATOMIC or BEGIN ATOMIC PARTITION (col = literal)
+ * on a cluster), the statements, then COMMIT or ROLLBACK.
+ *
+ * skaidb_transaction sends them around `body`: `begin` (NULL = "BEGIN"),
+ * body(client, user), COMMIT. The body runs its statements on the client it
+ * is given and returns SKAIDB_OK to commit; any other status rolls the
+ * transaction back and is returned as it is, with the error the body left
+ * in skaidb_last_error().
+ *
+ * A standalone server refuses a COMMIT when another writer changed a row
+ * the transaction writes after it began: nothing was committed, the
+ * transaction is over and the connection stays usable. The whole
+ * transaction is then run again from `begin`, at once, up to `attempts`
+ * runs in all (0 counts as 1) — so the body must be safe to run more than
+ * once. A conflict on the last run is returned: SKAIDB_ERR_SERVER with
+ * skaidb_last_error_is_transaction_conflict() true. Nothing else is run
+ * again: a refused `begin` (the body does not run), a body that failed, any
+ * other COMMIT error.
+ *
+ * While the transaction is open a lost connection is not replaced — on a new
+ * connection the rest of it would commit statement by statement — so the
+ * call that finds it gone returns SKAIDB_ERR_IO. Lost under a statement of
+ * the body, nothing was committed; lost under the COMMIT itself (the
+ * helper then returns SKAIDB_ERR_IO), the outcome is unknown: the server
+ * may have applied it before its reply went missing. A transaction written
+ * by hand with skaidb_execute has no such guard. */
+typedef skaidb_status_t (*skaidb_transaction_fn)(skaidb_client_t *client, void *user);
+skaidb_status_t skaidb_transaction(skaidb_client_t *client, const char *begin, uint32_t attempts,
+                                   skaidb_transaction_fn body, void *user);
+
+/* Whether the calling thread's last error is a COMMIT the server refused as
+ * a transaction conflict (its message starts with "transaction conflict:"):
+ * running the whole transaction again from its opening statement is safe.
+ * Like skaidb_last_error(), it speaks for the call that just failed. */
+bool skaidb_last_error_is_transaction_conflict(void);
+
 /* ---- statements ------------------------------------------------------- */
 
 /* Any statement — DDL, DML, SELECT, CALL, SHOW. */

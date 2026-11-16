@@ -67,14 +67,45 @@ impl Decimal {
     /// 16 + 4 bytes); only the text form switches.
     pub const MAX_PLAIN_SCALE: u32 = 1_000;
 
-    /// Lossy projection to `f64`, used for ordering and arithmetic interop.
+    /// Lossy projection to `f64`, used for keys, ordering and arithmetic
+    /// interop. Equal decimals project to one `f64` however they are spelled.
     pub fn to_f64(self) -> f64 {
+        // A mantissa up to 2^53 and a power of ten up to 10^22 are exact as
+        // `f64`, so their division is correctly rounded. Past those each step
+        // rounds on its own and the result depends on the spelling, so those
+        // project from the one normalised spelling.
+        let exact = self.mantissa.unsigned_abs() <= 1 << 53 && self.scale <= 22;
+        let d = if exact { self } else { self.normalized() };
         // `powi` takes an `i32`. Anything past ~10^308 is infinite, so a
         // scale beyond a few hundred projects to ±0 whatever its size;
         // clamping keeps that true instead of letting `as i32` wrap a huge
         // scale negative (1E-3000000000 came out as +inf).
-        let scale = self.scale.min(2 * Self::MAX_PLAIN_SCALE) as i32;
-        self.mantissa as f64 / 10f64.powi(scale)
+        let scale = d.scale.min(2 * Self::MAX_PLAIN_SCALE) as i32;
+        d.mantissa as f64 / 10f64.powi(scale)
+    }
+
+    /// Every other `f64` this value's key may hold on disk: an earlier build
+    /// divided the mantissa of whatever spelling it was given, so `…3.0` could
+    /// land a step away from `…3`. Spellings run to scale 18, the usual widest
+    /// fixed-point column: past it a key may be missed. Most values with seven
+    /// or more significant digits have one, so this is for reads that missed.
+    pub fn earlier_key_projections(self) -> Vec<f64> {
+        let d = self.normalized();
+        let now = d.to_f64().to_bits();
+        let mut out: Vec<f64> = Vec::new();
+        let (mut mantissa, mut scale) = (d.mantissa, d.scale);
+        while mantissa != 0 && scale <= 18 {
+            let p = mantissa as f64 / 10f64.powi(scale as i32);
+            if p.to_bits() != now && !out.iter().any(|o| o.to_bits() == p.to_bits()) {
+                out.push(p);
+            }
+            let Some(wider) = mantissa.checked_mul(10) else {
+                break;
+            };
+            mantissa = wider;
+            scale += 1;
+        }
+        out
     }
 
     /// The same number with no trailing zeros in its mantissa (`1.00` →
@@ -419,10 +450,79 @@ impl Value {
         out.push(tag::END);
     }
 
+    /// The other keys a primary key of `items` may be stored under, for a
+    /// decimal an earlier build keyed by another spelling
+    /// ([`Decimal::earlier_key_projections`]). Top-level decimals only, at most
+    /// [`Value::EARLIER_KEYS_MAX`]; empty unless one of them has such a key.
+    pub fn earlier_array_keys(items: &[&Value]) -> Vec<Vec<u8>> {
+        let options: Vec<Vec<f64>> = items
+            .iter()
+            .map(|v| match v {
+                Value::Decimal(d) => d.earlier_key_projections(),
+                _ => Vec::new(),
+            })
+            .collect();
+        if options.iter().all(Vec::is_empty) {
+            return Vec::new();
+        }
+        // Per item: `0` is the value as it keys now, `n` its `n-1`th earlier f64.
+        let mut pick = vec![0usize; items.len()];
+        let mut out = Vec::new();
+        loop {
+            let mut carry = items.len();
+            while carry > 0 {
+                carry -= 1;
+                pick[carry] += 1;
+                if pick[carry] <= options[carry].len() {
+                    break;
+                }
+                pick[carry] = 0;
+                if carry == 0 {
+                    return out;
+                }
+            }
+            let mut key = vec![tag::ARRAY];
+            for (i, item) in items.iter().enumerate() {
+                match pick[i] {
+                    0 => item.encode_into(&mut key),
+                    n => {
+                        key.push(tag::DECIMAL);
+                        encode_f64(options[i][n - 1], &mut key);
+                    }
+                }
+            }
+            key.push(tag::END);
+            out.push(key);
+            if out.len() == Self::EARLIER_KEYS_MAX {
+                return out;
+            }
+        }
+    }
+
+    /// Cap on [`Value::earlier_array_keys`].
+    pub const EARLIER_KEYS_MAX: usize = 64;
+
     /// Total order over values consistent with [`Value::encode_key`].
     ///
     /// Unlike `PartialOrd` on `f64`, this is total (NaN is ordered by bit
     /// pattern), so it is safe to use as a sort key.
+    /// Whether this value nests arrays / documents more than `max` levels
+    /// deep (a scalar is 0 levels, `[1]` is 1). Stops at the first branch
+    /// that is too deep; a scalar costs one comparison.
+    pub fn nests_deeper_than(&self, max: usize) -> bool {
+        match self {
+            Value::Array(items) => match max.checked_sub(1) {
+                None => true,
+                Some(left) => items.iter().any(|v| v.nests_deeper_than(left)),
+            },
+            Value::Document(doc) => match max.checked_sub(1) {
+                None => true,
+                Some(left) => doc.0.values().any(|v| v.nests_deeper_than(left)),
+            },
+            _ => false,
+        }
+    }
+
     pub fn total_cmp(&self, other: &Value) -> Ordering {
         self.encode_key().cmp(&other.encode_key())
     }
@@ -469,6 +569,78 @@ pub fn decode_numeric_key(component: &[u8]) -> Option<Value> {
         tag::TIMESTAMP => Some(Value::Timestamp((raw ^ SIGN) as i64)),
         tag::FLOAT | tag::DECIMAL => Some(Value::Float(float())),
         _ => None,
+    }
+}
+
+/// Decode an order-preserving ARRAY key ([`Value::encode_key`] of a
+/// `Value::Array`) whose components are all exact scalars — `Bool`,
+/// `Int`, `Timestamp`, `Float`, `String`, `Bytes`, `Uuid` — into those
+/// components. `None` for anything else: a `NULL` component (its tag is
+/// the array's terminator, so the decode ends there with bytes left over),
+/// a `Decimal` (keyed by its lossy `f64` projection), a nested array or
+/// document, a string that is not UTF-8, or a truncated or over-long key.
+/// An index entry key (`[values…, row key]`) and a row key (`[pk…]`) are
+/// such arrays.
+pub fn decode_scalar_key_tuple(bytes: &[u8]) -> Option<Vec<Value>> {
+    let (&t, mut rest) = bytes.split_first()?;
+    if t != tag::ARRAY {
+        return None;
+    }
+    let mut out = Vec::new();
+    loop {
+        let (&t, after) = rest.split_first()?;
+        rest = match t {
+            tag::END => return after.is_empty().then_some(out),
+            tag::BOOL => {
+                let (&b, after) = after.split_first()?;
+                out.push(Value::Bool(match b {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                }));
+                after
+            }
+            tag::INT | tag::TIMESTAMP | tag::FLOAT => {
+                out.push(decode_numeric_key(rest)?);
+                after.get(8..)?
+            }
+            tag::STRING | tag::BYTES => {
+                let (raw, after) = decode_escaped(after)?;
+                out.push(match t {
+                    tag::STRING => Value::String(String::from_utf8(raw).ok()?),
+                    _ => Value::Bytes(raw),
+                });
+                after
+            }
+            tag::UUID => {
+                out.push(Value::Uuid(Uuid(after.get(..16)?.try_into().ok()?)));
+                after.get(16..)?
+            }
+            _ => return None,
+        };
+    }
+}
+
+/// Inverse of `encode_bytes`: the unescaped bytes and what follows their
+/// terminator; `None` for a malformed escape or a missing terminator.
+fn decode_escaped(buf: &[u8]) -> Option<(Vec<u8>, &[u8])> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    loop {
+        match *buf.get(i)? {
+            0x00 => match *buf.get(i + 1)? {
+                0x00 => return Some((out, &buf[i + 2..])),
+                0xFF => {
+                    out.push(0x00);
+                    i += 2;
+                }
+                _ => return None,
+            },
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
     }
 }
 
@@ -647,6 +819,9 @@ pub enum ValueError {
     OutOfRange(&'static str),
     #[error("cannot represent value as JSON: {0}")]
     UnrepresentableJson(&'static str),
+    /// Arrays / documents nested past `codec::MAX_VALUE_DEPTH`.
+    #[error("value nests arrays or documents more than {0} levels deep")]
+    TooDeep(usize),
 }
 
 #[cfg(test)]
@@ -655,6 +830,45 @@ mod tests {
 
     fn cmp(a: Value, b: Value) -> Ordering {
         a.total_cmp(&b)
+    }
+
+    /// An index entry key and a row key decode back to their scalar
+    /// components; anything the encoding cannot give back exactly does not.
+    #[test]
+    fn scalar_key_tuples_decode_back() {
+        let row_key = Value::Array(vec![Value::String("a@b".into()), Value::Int(-7)]).encode_key();
+        let entry = vec![
+            Value::String("zap\u{0}lski".into()),
+            Value::Timestamp(1_700_000_000_123),
+            Value::Bool(true),
+            Value::Float(-0.0),
+            Value::Uuid(Uuid([7u8; 16])),
+            Value::Bytes(row_key.clone()),
+        ];
+        let key = Value::Array(entry.clone()).encode_key();
+        let back = decode_scalar_key_tuple(&key).expect("decodes");
+        assert_eq!(back.len(), entry.len());
+        for (a, b) in back.iter().zip(&entry) {
+            assert_eq!(a.encode_key(), b.encode_key(), "{a:?} vs {b:?}");
+            assert_eq!(std::mem::discriminant(a), std::mem::discriminant(b));
+        }
+        assert_eq!(
+            decode_scalar_key_tuple(&row_key),
+            Some(vec![Value::String("a@b".into()), Value::Int(-7)])
+        );
+        assert_eq!(decode_scalar_key_tuple(&Value::Array(vec![]).encode_key()), Some(vec![]));
+        // NULL (its tag is the terminator), a decimal, a nested array, a
+        // bare scalar, a truncated key and trailing bytes all refuse.
+        for refused in [
+            Value::Array(vec![Value::Null, Value::Bytes(row_key.clone())]).encode_key(),
+            Value::Array(vec![Value::Decimal(Decimal::new(125, 2)), Value::Int(1)]).encode_key(),
+            Value::Array(vec![Value::Array(vec![Value::Int(1)]), Value::Int(1)]).encode_key(),
+            Value::Int(5).encode_key(),
+            key[..key.len() - 3].to_vec(),
+            [key.as_slice(), &[0u8]].concat(),
+        ] {
+            assert_eq!(decode_scalar_key_tuple(&refused), None, "{refused:?}");
+        }
     }
 
     #[test]
@@ -832,6 +1046,68 @@ mod tests {
     /// The exact key meets on equal decimals whatever their scale and
     /// separates decimals the f64 projection collapses; other values
     /// encode as `encode_key` does.
+    #[test]
+    fn equal_decimals_key_alike_however_they_are_spelled() {
+        let key = |m: i128, s: u32| Value::Decimal(Decimal::new(m, s)).encode_key();
+        // Past 2^53 the mantissa rounds, and the division rounds again.
+        let m = 9_007_199_254_740_993i128;
+        assert_eq!(key(m, 0), key(m * 10, 1));
+        assert_eq!(key(m, 0), key(m * 1000, 3));
+        // Past 10^22 the divisor is inexact.
+        assert_eq!(key(1, 23), key(10, 24));
+        assert_eq!(key(-7, 40), key(-7_000, 43));
+        // Every spelling of a sweep of values, against its shortest one.
+        let mut x: i128 = 1;
+        for i in 0..2_000u32 {
+            x = (x * 6_364_136_223_846_793 + 1_442_695_040_888_963) % (1i128 << 62);
+            let m = if x % 10 == 0 { x + 1 } else { x };
+            let m = if i % 2 == 0 { m } else { -m };
+            let scale = i % 30;
+            let want = Decimal::new(m, scale).to_f64();
+            for k in 0..15u32 {
+                let wider = Decimal::new(m * 10i128.pow(k), scale + k);
+                assert_eq!(wider.to_f64().to_bits(), want.to_bits(), "{m} scale {scale} +{k}");
+            }
+        }
+    }
+
+    /// An earlier build's key of a value is found from any spelling of it, and
+    /// a value no spelling ever moved has none to look for.
+    #[test]
+    fn earlier_keys_cover_the_spellings_an_earlier_build_divided() {
+        let old = |m: i128, s: u32| m as f64 / 10f64.powi(s as i32);
+        let short = Decimal::new(9_007_199_254_740_993, 0);
+        let long = Decimal::new(90_071_992_547_409_930, 1);
+        assert_ne!(old(90_071_992_547_409_930, 1).to_bits(), long.to_f64().to_bits());
+        for spelling in [short, long] {
+            assert!(spelling.earlier_key_projections().contains(&old(90_071_992_547_409_930, 1)));
+            assert!(!spelling.earlier_key_projections().contains(&spelling.to_f64()));
+        }
+        assert!(Decimal::new(0, 3).earlier_key_projections().is_empty());
+        assert!(Decimal::new(15, 1).earlier_key_projections().is_empty());
+        assert!(Decimal::new(1_500_000_000_000_000_000, 18).earlier_key_projections().is_empty());
+
+        let (d, i, s) = (Value::Decimal(long), Value::Int(1), Value::String("x".into()));
+        assert!(Value::earlier_array_keys(&[&i, &s]).is_empty());
+        let keys = Value::earlier_array_keys(&[&i, &d]);
+        assert!(!keys.is_empty() && keys.len() <= Value::EARLIER_KEYS_MAX);
+        let now = Value::Array(vec![i.clone(), d.clone()]).encode_key();
+        assert!(!keys.contains(&now));
+        assert!(keys.iter().all(|k| k.len() == now.len()));
+        let two = Value::earlier_array_keys(&[&d, &d]);
+        assert!(two.len() > keys.len(), "the cross product of two decimals");
+    }
+
+    /// Below both limits the projection is what plain division gives, so no
+    /// stored key of an ordinary decimal moves.
+    #[test]
+    fn an_ordinary_decimal_projects_by_plain_division() {
+        for (m, s) in [(12_345i128, 2u32), (-1, 0), (150, 2), (1 << 53, 22), (-(1 << 53), 7)] {
+            let want = m as f64 / 10f64.powi(s as i32);
+            assert_eq!(Decimal::new(m, s).to_f64().to_bits(), want.to_bits());
+        }
+    }
+
     #[test]
     fn exact_key_is_canonical_for_decimals() {
         let dec = |m: i128, s: u32| Value::Array(vec![Value::Decimal(Decimal::new(m, s))]);

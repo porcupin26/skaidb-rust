@@ -692,6 +692,47 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::*;
 
+    /// A bound parameter is an encoded value from the client. One nested
+    /// thousands of arrays deep is a few kilobytes on the wire and used to
+    /// recurse once per level in the decoder — on a connection thread's
+    /// stack, where the overflow took the whole server down. It is now a
+    /// malformed request like any other.
+    #[test]
+    fn a_deeply_nested_parameter_is_a_malformed_request_not_a_dead_thread() {
+        let nested = |depth: usize| -> Vec<u8> {
+            let mut value = Vec::new();
+            for _ in 0..depth {
+                value.push(9u8); // ARRAY
+                value.extend_from_slice(&1u32.to_le_bytes());
+            }
+            value.push(0u8); // NULL
+            value
+        };
+        let execute = |param: &[u8]| -> Vec<u8> {
+            let mut req = vec![OP_EXECUTE, 0];
+            req.extend_from_slice(&7u32.to_le_bytes()); // statement id
+            req.extend_from_slice(&1u16.to_le_bytes()); // one parameter
+            req.extend_from_slice(&(param.len() as u32).to_le_bytes());
+            req.extend_from_slice(param);
+            req
+        };
+        // A sanely nested parameter still arrives.
+        match ClientRequest::decode(&execute(&nested(64))) {
+            Ok(ClientRequest::Execute { id: 7, params, .. }) => assert_eq!(params.len(), 1),
+            other => panic!("{other:?}"),
+        }
+        // 50,000 levels: 250 KB of headers. On a small stack, as a
+        // connection thread's is next to that.
+        let deep = execute(&nested(50_000));
+        let got = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || ClientRequest::decode(&deep).map(|_| ()))
+            .unwrap()
+            .join()
+            .expect("the decoder overflowed its stack");
+        assert_eq!(got, Err(ProtoError::Malformed("bad value encoding")));
+    }
+
     #[test]
     fn result_sets_round_trip() {
         let resp = Response::ResultSets {

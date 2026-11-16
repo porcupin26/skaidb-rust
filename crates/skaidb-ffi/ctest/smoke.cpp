@@ -188,6 +188,60 @@ int main() {
         ASSERT(e.status() == SKAIDB_ERR_INVALID);
     }
 
+    // Transactions: the helper commits, runs again on a conflict, throws
+    // the conflict after its attempts, and rolls back a body that threw.
+    {
+        auto other = skaidb::Client::connect(endpoint, user, password);
+        c.execute("DROP TABLE IF EXISTS cppffi_txn");
+        c.execute("CREATE TABLE cppffi_txn (PRIMARY KEY (id))");
+        c.execute("INSERT INTO cppffi_txn (id, n) VALUES (1, 0)");
+        auto n = [&] { return c.execute("SELECT n FROM cppffi_txn WHERE id = 1")[0][0].as_int(); };
+        int runs = 0;
+        c.transaction([&](skaidb::Client &tx) {
+            runs++;
+            tx.execute("UPDATE cppffi_txn SET n = n + 1 WHERE id = 1");
+            if (runs == 1) other.execute("UPDATE cppffi_txn SET n = n + 10 WHERE id = 1");
+        });
+        ASSERT(runs == 2 && n() == 11);
+        runs = 0;
+        try {
+            c.transaction(
+                [&](skaidb::Client &tx) {
+                    runs++;
+                    tx.execute("UPDATE cppffi_txn SET n = n + 1 WHERE id = 1");
+                    other.execute("UPDATE cppffi_txn SET n = n + 10 WHERE id = 1");
+                },
+                2);
+            ASSERT(false);
+        } catch (const skaidb::TransactionConflict &e) {
+            ASSERT(e.status() == SKAIDB_ERR_SERVER);
+            ASSERT(std::string(e.what()).find("transaction conflict:") != std::string::npos);
+        }
+        ASSERT(runs == 2 && n() == 31);
+        try {
+            c.transaction([&](skaidb::Client &tx) {
+                tx.execute("UPDATE cppffi_txn SET n = n + 1000 WHERE id = 1");
+                throw std::domain_error("boom");
+            });
+            ASSERT(false);
+        } catch (const std::domain_error &) {
+        }
+        ASSERT(n() == 31);
+        // By hand: the conflict is its own type, and still an Error.
+        c.execute("BEGIN");
+        c.execute("UPDATE cppffi_txn SET n = n + 1 WHERE id = 1");
+        other.execute("UPDATE cppffi_txn SET n = n + 10 WHERE id = 1");
+        try {
+            c.execute("COMMIT");
+            ASSERT(false);
+        } catch (const skaidb::Error &e) {
+            ASSERT(dynamic_cast<const skaidb::TransactionConflict *>(&e) != nullptr);
+        }
+        c.execute("ROLLBACK"); // nothing open: nothing to discard
+        ASSERT(n() == 41);
+        c.execute("DROP TABLE cppffi_txn");
+    }
+
     c.execute("DROP TABLE cppffi_smoke");
     std::cout << "C++ smoke: OK (libskaidb " << skaidb::version() << ")\n";
     return 0;

@@ -23,7 +23,7 @@ is tested with:
 
 ```toml
 [dependencies]
-skaidb = "0.335"
+skaidb = "0.347"
 ```
 
 Kerberos (GSSAPI) logins are behind the `kerberos` feature, which links the
@@ -32,7 +32,7 @@ MIT krb5 library through `cross-krb5`. Install the development headers first
 macOS and Windows) and enable the feature:
 
 ```toml
-skaidb = { version = "0.335", features = ["kerberos"] }
+skaidb = { version = "0.347", features = ["kerberos"] }
 ```
 
 The feature is off by default and never builds on static musl targets.
@@ -675,19 +675,56 @@ tables, privilege denials, constraint violations, scan-budget refusals,
 failover has already been attempted for (once): if you see it, both the
 original node and every peer failed. `DriverError` implements
 `std::error::Error` and `Display`, and converts `From` `io::Error` and
-`ProtoError`.
+`ProtoError`. `is_transaction_conflict()` is true for the `Server` error
+that refuses a `COMMIT` as a conflict — see [Transactions](#transactions).
 
 ## Transactions
 
-Against a standalone server, `BEGIN` / `COMMIT` / `ROLLBACK` are ordinary
-statements sent through `execute` and the transaction is per-connection
-session state. **On a cluster there are no transactions: every statement
-autocommits** and `BEGIN` is refused. To make several statements atomic on
-a cluster, put them in a procedure (`CREATE PROCEDURE … BEGIN … END`) and
-`CALL` it — one round trip, and a `CALL p(?)` binds through the normal
-prepared path. Because a failover can replay a statement once, make writes
-idempotent (`INSERT … ON CONFLICT DO UPDATE`, keyed `UPDATE`s) where a
-duplicate would matter.
+A transaction is statements on **one connection**: an opening statement,
+the statements, then `COMMIT` or `ROLLBACK`. A standalone server opens one
+with `BEGIN`; a cluster with `BEGIN ATOMIC` or `BEGIN ATOMIC PARTITION (col =
+literal)`. Outside a transaction every statement autocommits.
+
+`Client::transaction` sends them around a closure, on the client's own
+connection, and returns what the closure returned:
+
+```rust
+let left = client.transaction(3, |c| {
+    c.execute("UPDATE stock SET qty = qty - 1 WHERE id = 7")?;
+    match c.execute("SELECT qty FROM stock WHERE id = 7")? {
+        Response::Rows { rows, .. } => Ok(rows[0][0].clone()),
+        other => unreachable!("{other:?}"),
+    }
+})?;
+```
+
+- If the opening statement is refused, its error is returned and the
+  closure does not run — the statements after it would each commit on their
+  own.
+- An error from the closure rolls the transaction back and is returned as
+  it is, never run again.
+- A standalone server refuses a `COMMIT` when another writer changed a row
+  the transaction writes after it began: `DriverError::Server` with a
+  message that starts with `transaction conflict:`, which
+  `err.is_transaction_conflict()` tests. Nothing was committed and the
+  connection stays usable, so the helper runs the whole transaction again
+  from the opening statement — the first argument is how many runs in all
+  (at least one) — and returns the last conflict. The closure can therefore
+  run more than once: keep what it does outside the database repeatable.
+- `client.transaction_with("BEGIN ATOMIC PARTITION (tenant = 't1')", 3, |c|
+  …)` gives the opening statement, for a cluster.
+- While the helper's transaction is open a lost connection is **not**
+  replaced. The failover described above would send the rest of the
+  transaction to a connection with none open, where each statement commits
+  on its own; the error is returned instead. Lost under a statement of the
+  closure, nothing was committed; lost under the `COMMIT` itself, the
+  outcome is unknown.
+
+Written by hand, the same statements go through `execute`. Stop if the
+opening statement fails, and mind the failover: a statement it retries on a
+new connection runs outside the transaction. `ROLLBACK` with no transaction
+open succeeds and does nothing, so sending one from an error path is always
+safe (a server before 0.347 answers an error there).
 
 ## Client identification and versions
 

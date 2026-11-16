@@ -52,6 +52,21 @@ pub enum DriverError {
     NoEndpoint(String),
 }
 
+/// The prefix of the server error that refuses a `COMMIT` because another
+/// writer changed a row the transaction writes after its `BEGIN`
+/// (docs/PROTOCOL.md, "Connection lifecycle", rule 6). Nothing was applied
+/// and the transaction is over: running it again from `BEGIN` is safe.
+pub const TRANSACTION_CONFLICT_PREFIX: &str = "transaction conflict:";
+
+impl DriverError {
+    /// Whether this is the server refusing a `COMMIT` as a transaction
+    /// conflict ([`TRANSACTION_CONFLICT_PREFIX`]) — the one error
+    /// [`Client::transaction`] runs a transaction again for.
+    pub fn is_transaction_conflict(&self) -> bool {
+        matches!(self, DriverError::Server(msg) if msg.starts_with(TRANSACTION_CONFLICT_PREFIX))
+    }
+}
+
 /// The prefix of an `AuthOutcome::Denied` reason that is a CAPACITY
 /// refusal, not rejected credentials: the server is at
 /// `server.max_connections` and the slot this connection landed in is
@@ -113,6 +128,9 @@ pub struct Client {
     /// write, and asked for the dial order when the connection re-dials.
     /// `None` outside such a pool.
     link: Option<PoolLink>,
+    /// Set while [`Client::transaction`] has a transaction open: a
+    /// connection lost meanwhile is not replaced (see [`Client::reconnect`]).
+    in_transaction: bool,
 }
 
 /// Client-side TLS settings for a [`Client`]: the built rustls config plus the
@@ -330,6 +348,7 @@ impl Client {
                         database: None,
                         scan_budget_rows: 0,
                         link,
+                        in_transaction: false,
                     }
                     .said_hello());
                 }
@@ -532,6 +551,88 @@ impl Client {
 
     pub fn execute(&mut self, sql: &str) -> Result<Response, DriverError> {
         self.execute_with(sql, self.default_consistency)
+    }
+
+    /// Mark a transaction as open on this connection (`true`) or over
+    /// (`false`), for a caller that sends `BEGIN` / `COMMIT` / `ROLLBACK`
+    /// itself around code that uses the client by handle (the C driver's
+    /// `skaidb_transaction`): while one is open a lost connection is not
+    /// replaced, exactly as inside [`Client::transaction`].
+    #[doc(hidden)]
+    pub fn pin_transaction(&mut self, open: bool) {
+        self.in_transaction = open;
+    }
+
+    /// Test seam: shut this connection's socket down in both directions,
+    /// as a server that went away leaves it — the next round trip fails
+    /// with a transport error.
+    #[doc(hidden)]
+    pub fn sever_for_tests(&mut self) {
+        let _ = self.stream.tcp().shutdown(std::net::Shutdown::Both);
+    }
+
+    /// Run `body` in a transaction on this connection and commit it,
+    /// running it again — in a new transaction, from the start — when the
+    /// server refuses the `COMMIT` as a conflict
+    /// ([`DriverError::is_transaction_conflict`]: another writer changed a
+    /// row the transaction writes). `attempts` is how many times in all (at
+    /// least one); the last conflict is returned.
+    ///
+    /// An error from `body` rolls the transaction back and is returned as
+    /// it is, never retried. If the `BEGIN` is refused, `body` does not
+    /// run. A connection lost while the transaction is open is not
+    /// replaced, and the error is returned: lost under a statement of
+    /// `body`, nothing was committed; lost under the `COMMIT` itself, the
+    /// outcome is unknown — the server may have applied it before its
+    /// reply went missing.
+    ///
+    /// `body` runs once per attempt: keep what it does outside the
+    /// database repeatable. On a cluster, open with
+    /// [`Client::transaction_with`] and a `BEGIN ATOMIC …` statement.
+    pub fn transaction<T>(
+        &mut self,
+        attempts: u32,
+        body: impl FnMut(&mut Client) -> Result<T, DriverError>,
+    ) -> Result<T, DriverError> {
+        self.transaction_with("BEGIN", attempts, body)
+    }
+
+    /// [`Client::transaction`] with the opening statement given — `BEGIN
+    /// ATOMIC`, or `BEGIN ATOMIC PARTITION (tenant = 't1')`, on a cluster.
+    pub fn transaction_with<T>(
+        &mut self,
+        begin: &str,
+        attempts: u32,
+        mut body: impl FnMut(&mut Client) -> Result<T, DriverError>,
+    ) -> Result<T, DriverError> {
+        let mut left = attempts.max(1);
+        loop {
+            // Refused: nothing is open, and continuing would autocommit
+            // every statement of the body.
+            self.execute(begin)?;
+            self.in_transaction = true;
+            let out = body(self);
+            let out = match out {
+                Ok(value) => value,
+                Err(e) => {
+                    // Whatever the ROLLBACK answers, the caller hears the
+                    // error that caused it. (On a lost connection it is
+                    // not sent anywhere: the transaction died with it.)
+                    let _ = self.try_execute("ROLLBACK", self.default_consistency);
+                    self.in_transaction = false;
+                    return Err(e);
+                }
+            };
+            left -= 1;
+            let committed = self.try_execute("COMMIT", self.default_consistency);
+            // A COMMIT that failed has ended the transaction too.
+            self.in_transaction = false;
+            match committed {
+                Ok(_) => return Ok(out),
+                Err(e) if e.is_transaction_conflict() && left > 0 => {}
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Execute a statement at an explicit consistency level. If the live
@@ -968,6 +1069,20 @@ impl Client {
     /// ([`Client::with_database`]); prepared statements do not survive, since
     /// a statement id is only valid on the connection that created it.
     pub fn reconnect(&mut self) -> Result<(), DriverError> {
+        // A transaction lives on the connection that began it. Replaced
+        // mid-transaction, the new connection has none open: every
+        // statement the retry sent would autocommit, one by one, and the
+        // COMMIT would find nothing — the writes the caller asked to be
+        // all-or-nothing, applied in part. The loss is reported instead.
+        // (It says nothing about the outcome: lost under a statement of
+        // the body, nothing was committed; lost under the COMMIT itself,
+        // the server may have applied it before the reply went missing.)
+        if self.in_transaction {
+            return Err(DriverError::Io(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "connection lost inside a transaction (not replaced: a new connection would have none open)",
+            )));
+        }
         let ordered = match &self.link {
             // Pooled: the pool's current order — usable members first, the
             // member this connection just lost last.

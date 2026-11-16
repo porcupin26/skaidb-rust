@@ -601,8 +601,31 @@ fn transcode_key_value(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), ValueError
     Ok(())
 }
 
+/// How deep arrays and documents may nest in an encoded value. Decoding
+/// recurses once per level, and so does every later walk of the value
+/// (encoding, comparison, JSON, drop): without a ceiling a few kilobytes of
+/// nested array headers — `[[[[…]]]]`, five bytes a level — overflow the
+/// stack of whichever thread decodes them, and a stack overflow is not an
+/// error a caller can catch: the process dies. Bound parameters arrive as
+/// encoded values from a client, so that was one statement away.
+///
+/// 128 is the ceiling the two other ways of making a nested value already
+/// have (the SQL parser's nesting limit; JSON's recursion limit), so nothing
+/// they stored is refused here — and it keeps the deepest walk a few hundred
+/// kilobytes of stack even in an unoptimised build, inside the 1 MiB a
+/// non-main thread gets on Android.
+pub const MAX_VALUE_DEPTH: usize = 128;
+
 fn decode_value(cur: &mut Cursor<'_>) -> Result<Value, ValueError> {
+    decode_value_at(cur, 0)
+}
+
+/// [`decode_value`] for a value `depth` containers down.
+fn decode_value_at(cur: &mut Cursor<'_>, depth: usize) -> Result<Value, ValueError> {
     let t = cur.u8()?;
+    if depth >= MAX_VALUE_DEPTH && matches!(t, tag::ARRAY | tag::DOCUMENT) {
+        return Err(ValueError::TooDeep(MAX_VALUE_DEPTH));
+    }
     Ok(match t {
         tag::NULL => Value::Null,
         tag::BOOL => Value::Bool(cur.u8()? != 0),
@@ -634,7 +657,7 @@ fn decode_value(cur: &mut Cursor<'_>) -> Result<Value, ValueError> {
             }
             let mut items = Vec::with_capacity(n.min(4096));
             for _ in 0..n {
-                items.push(decode_value(cur)?);
+                items.push(decode_value_at(cur, depth + 1)?);
             }
             Value::Array(items)
         }
@@ -647,7 +670,7 @@ fn decode_value(cur: &mut Cursor<'_>) -> Result<Value, ValueError> {
             let mut doc = Document::new();
             for _ in 0..n {
                 let key = cur.string()?;
-                let val = decode_value(cur)?;
+                let val = decode_value_at(cur, depth + 1)?;
                 doc.insert(key, val);
             }
             Value::Document(doc)
@@ -663,7 +686,16 @@ fn decode_value(cur: &mut Cursor<'_>) -> Result<Value, ValueError> {
 /// doesn't want without paying their decode cost (the entire point: a large
 /// unwanted `String`/`Bytes` field skips in O(1) beyond reading its length).
 fn skip_value(cur: &mut Cursor<'_>) -> Result<(), ValueError> {
+    skip_value_at(cur, 0)
+}
+
+/// [`skip_value`] for a value `depth` containers down — the same ceiling as
+/// [`decode_value_at`], for the same reason: it recurses per level too.
+fn skip_value_at(cur: &mut Cursor<'_>, depth: usize) -> Result<(), ValueError> {
     let t = cur.u8()?;
+    if depth >= MAX_VALUE_DEPTH && matches!(t, tag::ARRAY | tag::DOCUMENT) {
+        return Err(ValueError::TooDeep(MAX_VALUE_DEPTH));
+    }
     match t {
         tag::NULL => {}
         tag::BOOL => {
@@ -686,7 +718,7 @@ fn skip_value(cur: &mut Cursor<'_>) -> Result<(), ValueError> {
         tag::ARRAY => {
             let n = cur.u32()? as usize;
             for _ in 0..n {
-                skip_value(cur)?;
+                skip_value_at(cur, depth + 1)?;
             }
         }
         tag::DOCUMENT => {
@@ -694,7 +726,7 @@ fn skip_value(cur: &mut Cursor<'_>) -> Result<(), ValueError> {
             for _ in 0..n {
                 let len = cur.u32()? as usize; // key length prefix, no UTF-8
                 cur.take(len)?; // check/decode needed — the key is discarded
-                skip_value(cur)?;
+                skip_value_at(cur, depth + 1)?;
             }
         }
         _ => return Err(ValueError::UnrepresentableJson("unknown value tag")),
@@ -705,6 +737,86 @@ fn skip_value(cur: &mut Cursor<'_>) -> Result<(), ValueError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `depth` arrays, one inside the other, around a NULL — five bytes a
+    /// level, as a client would send them.
+    fn nested_arrays(depth: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(depth * 5 + 1);
+        for _ in 0..depth {
+            bytes.push(tag::ARRAY);
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+        }
+        bytes.push(tag::NULL);
+        bytes
+    }
+
+    /// The same nesting as documents: `{"k": {"k": … }}`.
+    fn nested_documents(depth: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for _ in 0..depth {
+            bytes.push(tag::DOCUMENT);
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.push(b'k');
+        }
+        bytes.push(tag::NULL);
+        bytes
+    }
+
+    /// Run `f` on a thread with a small stack: an unbounded recursion dies
+    /// there (the test process with it) long before it would on the test
+    /// harness's own stack.
+    fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .expect("the decoder overflowed its stack or panicked")
+    }
+
+    #[test]
+    fn nesting_is_decoded_up_to_the_ceiling_and_refused_past_it() {
+        for build in [nested_arrays as fn(usize) -> Vec<u8>, nested_documents] {
+            // At the ceiling: decoded, and the value round-trips.
+            let at = build(MAX_VALUE_DEPTH);
+            let value = Value::decode(&at).expect("a value at the ceiling decodes");
+            assert_eq!(value.encode(), at);
+            // One past it, and absurdly past it: an error, not a dead thread.
+            for depth in [MAX_VALUE_DEPTH + 1, 5_000, 200_000] {
+                let bytes = build(depth);
+                let got = on_small_stack(move || Value::decode(&bytes));
+                assert_eq!(got, Err(ValueError::TooDeep(MAX_VALUE_DEPTH)), "depth {depth}");
+            }
+        }
+    }
+
+    /// The projected decoders SKIP the fields they were not asked for, and
+    /// skipping recurses too: a deep value in an unwanted field must be
+    /// refused the same way.
+    #[test]
+    fn a_skipped_field_is_held_to_the_same_ceiling() {
+        let row = |deep: Vec<u8>| -> Vec<u8> {
+            let mut bytes = vec![tag::DOCUMENT];
+            bytes.extend_from_slice(&2u32.to_le_bytes());
+            for (key, value) in [("deep", deep), ("want", Value::Int(7).encode())] {
+                bytes.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(key.as_bytes());
+                bytes.extend_from_slice(&value);
+            }
+            bytes
+        };
+        let wanted: std::collections::HashSet<String> = ["want".to_string()].into();
+        // Under the ceiling the unwanted field is walked past.
+        let ok = row(nested_arrays(MAX_VALUE_DEPTH));
+        let doc = Value::decode_document_projected(&ok, &wanted).unwrap();
+        assert_eq!(doc.get("want"), Some(&Value::Int(7)));
+        // Past it: refused, on a stack the unbounded skip would have blown.
+        let deep = row(nested_arrays(100_000));
+        let w = wanted.clone();
+        let got = on_small_stack(move || Value::decode_document_projected(&deep, &w));
+        assert_eq!(got, Err(ValueError::TooDeep(MAX_VALUE_DEPTH)));
+    }
 
     fn roundtrip(v: Value) {
         let bytes = v.encode();

@@ -26,12 +26,14 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <iterator>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -46,6 +48,15 @@ public:
 
 private:
     skaidb_status_t status_;
+};
+
+/* A COMMIT the server refused because another writer changed a row the
+ * transaction writes: nothing was committed, the transaction is over, and
+ * running it again from its opening statement is safe — which is what
+ * Client::transaction does. */
+class TransactionConflict : public Error {
+public:
+    using Error::Error;
 };
 
 enum class Consistency : int { One = SKAIDB_ONE, Quorum = SKAIDB_QUORUM, All = SKAIDB_ALL };
@@ -113,7 +124,9 @@ inline std::string last_error() {
 }
 
 inline void check(skaidb_status_t s) {
-    if (s != SKAIDB_OK) throw Error(s, last_error());
+    if (s == SKAIDB_OK) return;
+    if (skaidb_last_error_is_transaction_conflict()) throw TransactionConflict(s, last_error());
+    throw Error(s, last_error());
 }
 
 template <class T>
@@ -627,6 +640,39 @@ public:
         detail::check(skaidb_client_add_endpoints(p_.get(), eps.data(), eps.size()));
     }
     void reconnect() { detail::check(skaidb_client_reconnect(p_.get())); }
+
+    /* Run `body(*this)` in a transaction on this connection: `begin`, the
+     * body, COMMIT — and run it again, up to `attempts` runs in all, while
+     * the server refuses the COMMIT as a conflict (the last one is thrown
+     * as TransactionConflict). An exception out of the body rolls the
+     * transaction back and is rethrown as it is, never run again. The body
+     * may run more than once: keep what it does outside the database
+     * repeatable. See skaidb_transaction. */
+    template <class F>
+    void transaction(F &&body, std::uint32_t attempts = 3, const std::string &begin = "BEGIN") {
+        struct Run {
+            Client *self;
+            typename std::remove_reference<F>::type *body;
+            std::exception_ptr thrown;
+        } run{this, &body, nullptr};
+        const skaidb_status_t s = skaidb_transaction(
+            p_.get(), begin.c_str(), attempts,
+            [](skaidb_client_t *, void *user) -> skaidb_status_t {
+                auto *r = static_cast<Run *>(user);
+                try {
+                    (*r->body)(*r->self);
+                    return SKAIDB_OK;
+                } catch (...) {
+                    // An exception must not unwind through the C frames:
+                    // kept, the transaction rolled back, rethrown below.
+                    r->thrown = std::current_exception();
+                    return SKAIDB_ERR_INVALID;
+                }
+            },
+            &run);
+        if (run.thrown) std::rethrow_exception(run.thrown);
+        detail::check(s);
+    }
 
     /* Any statement — DDL, DML, SELECT, CALL, SHOW. */
     Result execute(const std::string &sql) {

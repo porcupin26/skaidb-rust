@@ -30,7 +30,7 @@
 #![allow(non_camel_case_types)]
 
 use std::cell::RefCell;
-use std::ffi::{c_char, c_int, CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::ptr;
 use std::time::Duration;
 
@@ -562,6 +562,84 @@ pub unsafe extern "C" fn skaidb_client_reconnect(client: *mut skaidb_client) -> 
             Err(e) => fail_driver(e),
         },
         Err(s) => s,
+    }
+}
+
+// ---- transactions --------------------------------------------------------
+
+/// What [`fail_driver`] writes in front of a server's message.
+const SERVER_ERROR_PREFIX: &str = "server error: ";
+
+/// Whether the calling thread's last error is the server refusing a
+/// `COMMIT` as a transaction conflict (the header's
+/// `skaidb_last_error_is_transaction_conflict`).
+#[no_mangle]
+pub extern "C" fn skaidb_last_error_is_transaction_conflict() -> bool {
+    LAST_ERROR.with(|e| {
+        e.borrow().to_str().is_ok_and(|msg| {
+            msg.strip_prefix(SERVER_ERROR_PREFIX)
+                .is_some_and(|server| server.starts_with(skaidb::TRANSACTION_CONFLICT_PREFIX))
+        })
+    })
+}
+
+/// The header's `skaidb_transaction_fn`.
+pub type skaidb_transaction_fn =
+    Option<unsafe extern "C" fn(client: *mut skaidb_client, user: *mut c_void) -> skaidb_status>;
+
+/// The header's `skaidb_transaction`: `begin` (NULL = `BEGIN`), `body`,
+/// `COMMIT` on this one connection, run again — up to `attempts` times in
+/// all, 0 counting as 1 — while the server refuses the `COMMIT` as a
+/// conflict. A body that returns anything but `SKAIDB_OK` is rolled back
+/// and its status returned, with the error it left.
+///
+/// Each step borrows the client for its own call only: the body is handed
+/// the same handle and uses it through the ordinary entry points.
+#[no_mangle]
+pub unsafe extern "C" fn skaidb_transaction(
+    client: *mut skaidb_client,
+    begin: *const c_char,
+    attempts: u32,
+    body: skaidb_transaction_fn,
+    user: *mut c_void,
+) -> skaidb_status {
+    if client.is_null() {
+        return fail(SKAIDB_ERR_INVALID, "client is NULL");
+    }
+    let Some(body) = body else {
+        return fail(SKAIDB_ERR_INVALID, "body is NULL");
+    };
+    let begin = match cstr_opt(begin, "begin") {
+        Ok(text) => text.unwrap_or("BEGIN").to_string(),
+        Err(status) => return status,
+    };
+    let mut left = attempts.max(1);
+    loop {
+        // Refused: nothing is open, and the body's statements would each
+        // commit on their own.
+        if let Err(e) = (*client).0.execute(&begin) {
+            return fail_driver(e);
+        }
+        (*client).0.pin_transaction(true);
+        let status = body(client, user);
+        if status != SKAIDB_OK {
+            // The body's error is the one reported, whatever the ROLLBACK
+            // answers.
+            let kept = LAST_ERROR.with(|e| e.borrow().clone());
+            let _ = (*client).0.execute("ROLLBACK");
+            (*client).0.pin_transaction(false);
+            LAST_ERROR.with(|e| *e.borrow_mut() = kept);
+            return status;
+        }
+        left -= 1;
+        let committed = (*client).0.execute("COMMIT");
+        // A COMMIT that failed has ended the transaction too.
+        (*client).0.pin_transaction(false);
+        match committed {
+            Ok(_) => return SKAIDB_OK,
+            Err(e) if e.is_transaction_conflict() && left > 0 => {}
+            Err(e) => return fail_driver(e),
+        }
     }
 }
 

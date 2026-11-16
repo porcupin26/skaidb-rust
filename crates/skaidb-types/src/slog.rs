@@ -38,11 +38,16 @@ pub fn set_log_observer(observer: LogObserver) {
 
 /// Point the server log at `path` (empty = stderr). Idempotent: only the first
 /// call wins, so it should run once early in startup, before workers spawn. A
-/// path that can't be opened logs the reason once and stays on stderr.
+/// path that can't be opened logs the reason once and stays on stderr. The
+/// file's directory is created if missing: this runs before the engine open
+/// that creates the data directory, and the log file may live inside it.
 pub fn init_server_log(path: &str) {
     let sink = if path.is_empty() {
         Sink::Stderr
     } else {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         match OpenOptions::new().create(true).append(true).open(path) {
             Ok(f) => Sink::File(Mutex::new(f)),
             Err(e) => {

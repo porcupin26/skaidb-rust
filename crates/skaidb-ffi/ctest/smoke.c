@@ -28,6 +28,38 @@
         }                                                                               \
     } while (0)
 
+/* What a transaction body is told: the client of another writer, how often
+ * that writer gets in first, and how many times the body has run. */
+struct txn_run {
+    skaidb_client_t *other;
+    int race_runs;
+    int runs;
+    int fail;
+};
+
+static skaidb_status_t txn_body(skaidb_client_t *c, void *user) {
+    struct txn_run *run = user;
+    skaidb_result_t *r = NULL;
+    run->runs++;
+    skaidb_status_t s = skaidb_execute(c, "UPDATE cffi_txn SET n = n + 1 WHERE id = 1", &r);
+    if (s != SKAIDB_OK) return s;
+    skaidb_result_free(r);
+    if (run->runs <= run->race_runs) {
+        CHECK(skaidb_execute(run->other, "UPDATE cffi_txn SET n = n + 10 WHERE id = 1", &r));
+        skaidb_result_free(r);
+    }
+    if (run->fail) return skaidb_execute(c, "INSERT INTO cffi_no_such_table (id) VALUES (1)", &r);
+    return SKAIDB_OK;
+}
+
+static int64_t txn_n(skaidb_client_t *c) {
+    skaidb_result_t *r = NULL;
+    CHECK(skaidb_execute(c, "SELECT n FROM cffi_txn WHERE id = 1", &r));
+    int64_t n = skaidb_value_get_int(skaidb_result_cell(r, 0, 0));
+    skaidb_result_free(r);
+    return n;
+}
+
 static const char *env_or(const char *name, const char *dflt) {
     const char *v = getenv(name);
     return v && *v ? v : dflt;
@@ -338,6 +370,47 @@ int main(void) {
     skaidb_pool_options_init(&opts);
     opts.maxsize = 0;
     ASSERT(skaidb_pool_new_balanced(eps, 1, user, password, NULL, NULL, &opts, &bpool) == SKAIDB_ERR_INVALID);
+
+    /* Transactions: the helper commits, runs again on a conflict, gives the
+     * conflict back after its attempts, and rolls back a body that failed. */
+    skaidb_client_t *other = NULL;
+    CHECK(skaidb_connect(eps, 1, user, password, NULL, &other));
+    CHECK(skaidb_execute(c, "DROP TABLE IF EXISTS cffi_txn", &r));
+    skaidb_result_free(r);
+    CHECK(skaidb_execute(c, "CREATE TABLE cffi_txn (PRIMARY KEY (id))", &r));
+    skaidb_result_free(r);
+    CHECK(skaidb_execute(c, "INSERT INTO cffi_txn (id, n) VALUES (1, 0)", &r));
+    skaidb_result_free(r);
+    struct txn_run run = {other, 0, 0, 0};
+    CHECK(skaidb_transaction(c, NULL, 3, txn_body, &run));
+    ASSERT(run.runs == 1 && txn_n(c) == 1);
+    ASSERT(!skaidb_last_error_is_transaction_conflict());
+    run = (struct txn_run){other, 2, 0, 0}; /* the other writer wins twice */
+    CHECK(skaidb_transaction(c, "BEGIN", 3, txn_body, &run));
+    ASSERT(run.runs == 3 && txn_n(c) == 22);
+    run = (struct txn_run){other, 9, 0, 0}; /* ... and every time */
+    ASSERT(skaidb_transaction(c, NULL, 2, txn_body, &run) == SKAIDB_ERR_SERVER);
+    ASSERT(skaidb_last_error_is_transaction_conflict());
+    ASSERT(strstr(skaidb_last_error(), "transaction conflict:") != NULL);
+    ASSERT(run.runs == 2 && txn_n(c) == 42);
+    run = (struct txn_run){other, 0, 0, 1}; /* the body fails: rolled back, its error kept */
+    ASSERT(skaidb_transaction(c, NULL, 3, txn_body, &run) == SKAIDB_ERR_SERVER);
+    ASSERT(strstr(skaidb_last_error(), "cffi_no_such_table") != NULL);
+    ASSERT(!skaidb_last_error_is_transaction_conflict());
+    ASSERT(run.runs == 1 && txn_n(c) == 42);
+    /* Nothing is left open: a ROLLBACK now has nothing to discard and
+     * succeeds, a COMMIT has nothing to apply and does not. */
+    CHECK(skaidb_execute(c, "ROLLBACK", &r));
+    skaidb_result_free(r);
+    ASSERT(skaidb_execute(c, "COMMIT", &r) == SKAIDB_ERR_SERVER);
+    /* A refused opening statement: the body does not run. */
+    run = (struct txn_run){other, 0, 0, 0};
+    ASSERT(skaidb_transaction(c, "BEGIN ATOMIC PARTITION (tenant = 't1')", 3, txn_body, &run) == SKAIDB_ERR_SERVER);
+    ASSERT(run.runs == 0);
+    ASSERT(skaidb_transaction(c, NULL, 3, NULL, NULL) == SKAIDB_ERR_INVALID);
+    CHECK(skaidb_execute(c, "DROP TABLE cffi_txn", &r));
+    skaidb_result_free(r);
+    skaidb_client_free(other);
 
     CHECK(skaidb_execute(c, "DROP TABLE cffi_smoke", &r));
     skaidb_result_free(r);
