@@ -977,6 +977,101 @@ fn skip_escaped_bytes(b: &[u8]) -> Option<usize> {
     None
 }
 
+/// How many leading components of a key [`note_key_types`] tells the types
+/// of: a primary key or an index rarely has more columns, and a position
+/// past these is simply not known.
+pub const KEY_POSITIONS: usize = 8;
+
+/// Every type at once: what a position holds when it cannot be read.
+pub const KEY_TYPES_ANY: u16 = u16::MAX;
+
+/// The bit of the type `tag` keys in a position's set of types.
+pub fn key_type_bit(tag: u8) -> u16 {
+    1u16.checked_shl(u32::from(tag)).unwrap_or(0)
+}
+
+/// Add the type of each leading component of `key` — an order-preserving
+/// ARRAY key ([`Value::encode_key`] of a `Value::Array`: a row key
+/// `[pk…]`, an index entry `[values…, row key]`) — to `seen`, one set of
+/// types per position ([`key_type_bit`]). What a store keeps so that "no
+/// key has a float at its second position" is known without looking.
+///
+/// A set only ever grows, and never says less than the key holds: a
+/// component that is itself an array or a document (a nested `0x00` is a
+/// null element or the terminator — there is no reliable skip) leaves every
+/// position after it holding [`KEY_TYPES_ANY`], and so does a key that is
+/// not such an array at all or ends early — from the position where it
+/// stops being readable, or from the first for one that is no array.
+pub fn note_key_types(key: &[u8], seen: &mut [u16; KEY_POSITIONS]) {
+    let unreadable_from = |seen: &mut [u16; KEY_POSITIONS], at: usize| {
+        for s in &mut seen[at..] {
+            *s = KEY_TYPES_ANY;
+        }
+    };
+    if key.first() != Some(&tag::ARRAY) {
+        return unreadable_from(seen, 0);
+    }
+    let mut pos = 1usize;
+    for at in 0..KEY_POSITIONS {
+        let Some(&t) = key.get(pos) else {
+            return unreadable_from(seen, at);
+        };
+        pos += 1;
+        let skip = match t {
+            // The array's own terminator ends the key; anywhere else the
+            // byte is a NULL component.
+            tag::END if pos == key.len() => return,
+            tag::NULL => 0,
+            tag::BOOL => 1,
+            tag::INT | tag::TIMESTAMP | tag::FLOAT | tag::DECIMAL => 8,
+            tag::UUID => 16,
+            tag::STRING | tag::BYTES => match skip_escaped_bytes(&key[pos..]) {
+                Some(n) => n,
+                None => return unreadable_from(seen, at),
+            },
+            tag::ARRAY | tag::DOCUMENT => {
+                seen[at] |= key_type_bit(t);
+                return unreadable_from(seen, at + 1);
+            }
+            _ => return unreadable_from(seen, at),
+        };
+        pos += skip;
+        if pos > key.len() {
+            return unreadable_from(seen, at);
+        }
+        seen[at] |= key_type_bit(t);
+    }
+}
+
+/// How many components the key prefix `prefix` holds — the position of the
+/// component that would follow it. `prefix` is an ARRAY key without its
+/// terminator (the array tag and whole scalar components). `None` when it
+/// is anything else, or holds a nested array or document.
+pub fn key_prefix_positions(prefix: &[u8]) -> Option<usize> {
+    if prefix.first() != Some(&tag::ARRAY) {
+        return None;
+    }
+    let (mut pos, mut n) = (1usize, 0usize);
+    while pos < prefix.len() {
+        let t = prefix[pos];
+        pos += 1;
+        let skip = match t {
+            tag::NULL => 0,
+            tag::BOOL => 1,
+            tag::INT | tag::TIMESTAMP | tag::FLOAT | tag::DECIMAL => 8,
+            tag::UUID => 16,
+            tag::STRING | tag::BYTES => skip_escaped_bytes(&prefix[pos..])?,
+            _ => return None,
+        };
+        pos = pos.checked_add(skip)?;
+        if pos > prefix.len() {
+            return None;
+        }
+        n += 1;
+    }
+    Some(n)
+}
+
 pub(crate) fn encode_i64(v: i64, out: &mut Vec<u8>) {
     // Flip the sign bit so two's-complement order becomes unsigned byte order.
     let u = (v as u64) ^ 0x8000_0000_0000_0000;
@@ -1623,5 +1718,98 @@ mod tests {
         let mut trunc = pk_key(vec![Value::String("abc".into())]);
         trunc.truncate(3);
         assert_eq!(encoded_array_prefix(&trunc, 1), None);
+    }
+
+    fn types_of(key: &[u8]) -> [u16; KEY_POSITIONS] {
+        let mut seen = [0u16; KEY_POSITIONS];
+        note_key_types(key, &mut seen);
+        seen
+    }
+
+    fn bits(values: &[Value]) -> u16 {
+        values.iter().fold(0, |m, v| m | key_type_bit(key_tag(v)))
+    }
+
+    #[test]
+    fn a_key_tells_the_type_at_each_of_its_positions() {
+        let key = pk_key(vec![
+            Value::String("a\0b".into()),
+            Value::Int(7),
+            Value::Float(1.5),
+            Value::Timestamp(9),
+            Value::Bool(true),
+            Value::Uuid(Uuid([3; 16])),
+            Value::Bytes(vec![0, 0, 1]),
+            Value::Decimal(Decimal::new(15, 1)),
+            Value::Int(1), // a ninth component: past what is told
+        ]);
+        let seen = types_of(&key);
+        let want = [
+            Value::String(String::new()),
+            Value::Int(0),
+            Value::Float(0.0),
+            Value::Timestamp(0),
+            Value::Bool(false),
+            Value::Uuid(Uuid([0; 16])),
+            Value::Bytes(Vec::new()),
+            Value::Decimal(Decimal::new(0, 0)),
+        ];
+        for (at, v) in want.iter().enumerate() {
+            assert_eq!(seen[at], bits(std::slice::from_ref(v)), "position {at}");
+        }
+        // Sets grow: a second key of other types adds to each position.
+        let mut seen = seen;
+        note_key_types(&pk_key(vec![Value::Int(1), Value::String("x".into())]), &mut seen);
+        assert_eq!(seen[0], bits(&[Value::String(String::new()), Value::Int(0)]));
+        assert_eq!(seen[1], bits(&[Value::String(String::new()), Value::Int(0)]));
+        assert_eq!(seen[2], bits(&[Value::Float(0.0)]), "a shorter key adds nothing past its end");
+        // A NULL component is one byte, and is not the terminator.
+        let seen = types_of(&pk_key(vec![Value::Null, Value::Int(1)]));
+        assert_eq!((seen[0], seen[1], seen[2]), (bits(&[Value::Null]), bits(&[Value::Int(0)]), 0));
+        assert_eq!(types_of(&pk_key(vec![]))[0], 0);
+    }
+
+    #[test]
+    fn a_key_that_cannot_be_read_holds_every_type_from_there_on() {
+        // Not an array at all.
+        assert_eq!(types_of(&Value::Int(1).encode_key()), [KEY_TYPES_ANY; KEY_POSITIONS]);
+        assert_eq!(types_of(b""), [KEY_TYPES_ANY; KEY_POSITIONS]);
+        assert_eq!(types_of(b"t00001/8/1"), [KEY_TYPES_ANY; KEY_POSITIONS]);
+        // A nested array: its own position is told, nothing after it.
+        let seen = types_of(&pk_key(vec![Value::Int(1), Value::Array(vec![Value::Null]), Value::Int(2)]));
+        assert_eq!(seen[0], bits(&[Value::Int(0)]));
+        assert_eq!(seen[1], bits(&[Value::Array(Vec::new())]));
+        assert!(seen[2..].iter().all(|s| *s == KEY_TYPES_ANY));
+        let seen = types_of(&pk_key(vec![Value::Document(Document::new()), Value::Int(2)]));
+        assert_eq!(seen[0], bits(&[Value::Document(Document::new())]));
+        assert!(seen[1..].iter().all(|s| *s == KEY_TYPES_ANY));
+        // Cut short inside a component, and with no terminator.
+        let mut cut = pk_key(vec![Value::Int(1), Value::String("abc".into())]);
+        cut.truncate(cut.len() - 3);
+        let seen = types_of(&cut);
+        assert_eq!(seen[0], bits(&[Value::Int(0)]));
+        assert!(seen[1..].iter().all(|s| *s == KEY_TYPES_ANY));
+        let mut open = pk_key(vec![Value::Int(1)]);
+        open.pop();
+        let seen = types_of(&open);
+        assert_eq!(seen[0], bits(&[Value::Int(0)]));
+        assert!(seen[1..].iter().all(|s| *s == KEY_TYPES_ANY));
+        // An unknown tag.
+        assert_eq!(types_of(&[tag::ARRAY, 0x7f, 0x00]), [KEY_TYPES_ANY; KEY_POSITIONS]);
+    }
+
+    #[test]
+    fn a_key_prefix_tells_how_many_components_it_holds() {
+        let full = pk_key(vec![Value::String("org".into()), Value::Int(7), Value::Bool(true)]);
+        assert_eq!(key_prefix_positions(&[tag::ARRAY]), Some(0));
+        assert_eq!(key_prefix_positions(encoded_array_prefix(&full, 1).unwrap()), Some(1));
+        assert_eq!(key_prefix_positions(encoded_array_prefix(&full, 2).unwrap()), Some(2));
+        assert_eq!(key_prefix_positions(&full[..full.len() - 1]), Some(3));
+        assert_eq!(key_prefix_positions(b""), None);
+        assert_eq!(key_prefix_positions(&Value::Int(1).encode_key()), None);
+        // Cut inside a component, or holding a nested array.
+        assert_eq!(key_prefix_positions(&full[..3]), None);
+        let nested = pk_key(vec![Value::Array(vec![Value::Int(1)]), Value::Int(2)]);
+        assert_eq!(key_prefix_positions(&nested[..nested.len() - 1]), None);
     }
 }

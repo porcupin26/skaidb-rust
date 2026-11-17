@@ -124,14 +124,30 @@ skaidb_status_t skaidb_connect_gssapi(const char *const *endpoints, size_t n_end
 
 void skaidb_client_free(skaidb_client_t *client);
 
+/* Session state. What a session keeps on its connection the driver notes
+ * and gives back to every connection that replaces it, before the next
+ * statement is sent: the database (skaidb_client_use_database, or a USE
+ * statement through skaidb_execute), then a SET CONSISTENCY override, then
+ * the scan budget (a SET SCAN BUDGET statement, or
+ * skaidb_client_set_scan_budget_rows — one setting, the later wins). SET ...
+ * DEFAULT clears a setting. If the new connection refuses one of them, the
+ * statement fails with that error and so does every one after it: none runs
+ * in another database or under other settings. A USE that finds the
+ * connection gone is sent without entering the old database first.
+ *
+ * A connection the server closed while it sat idle is found by a look at
+ * its socket before a request is written (no round trip) and replaced
+ * first, so the statement is sent once. */
+
 /* Bind (or rebind) the session database: USE now and again after every
- * failover. A refusal leaves the previous binding and the connection intact. */
+ * failover. A refusal leaves the previous binding as it was. */
 skaidb_status_t skaidb_client_use_database(skaidb_client_t *client, const char *database);
 
 /* Default consistency for later calls (the driver starts at SKAIDB_QUORUM). */
 void skaidb_client_set_consistency(skaidb_client_t *client, skaidb_consistency_t consistency);
 
-/* SET SCAN BUDGET ROWS n (0 = server default), replayed after reconnects. */
+/* SET SCAN BUDGET ROWS n (0 = SET SCAN BUDGET DEFAULT), replayed after
+ * reconnects. */
 skaidb_status_t skaidb_client_set_scan_budget_rows(skaidb_client_t *client, uint64_t rows);
 
 /* The endpoint the live connection uses ("host:port"), malloc'd. */
@@ -141,7 +157,8 @@ char *skaidb_client_endpoint_dup(const skaidb_client_t *client);
 skaidb_status_t skaidb_client_add_endpoints(skaidb_client_t *client,
                                             const char *const *endpoints, size_t n_endpoints);
 
-/* Drop the live connection and dial another node. */
+/* Drop the live connection and dial another node; the session's state is
+ * given back to it. SKAIDB_ERR_IO while a transaction is open. */
 skaidb_status_t skaidb_client_reconnect(skaidb_client_t *client);
 
 /* ---- transactions ----------------------------------------------------- */
@@ -171,8 +188,17 @@ skaidb_status_t skaidb_client_reconnect(skaidb_client_t *client);
  * call that finds it gone returns SKAIDB_ERR_IO. Lost under a statement of
  * the body, nothing was committed; lost under the COMMIT itself (the
  * helper then returns SKAIDB_ERR_IO), the outcome is unknown: the server
- * may have applied it before its reply went missing. A transaction written
- * by hand with skaidb_execute has no such guard. */
+ * may have applied it before its reply went missing.
+ *
+ * A transaction written by hand with skaidb_execute is guarded the same
+ * way. The driver notes it: an accepted statement whose first word is BEGIN
+ * opens it, and the answer to a statement that is exactly COMMIT
+ * [TRANSACTION] or ROLLBACK [TRANSACTION] ends it. Lost in between, every
+ * statement returns SKAIDB_ERR_IO and none is sent; ROLLBACK then succeeds
+ * without being sent (the server discarded the transaction with the
+ * connection), COMMIT fails with a message that says nothing was committed
+ * — or, lost under the COMMIT itself, that the outcome is unknown — and the
+ * statement after either dials as usual. */
 typedef skaidb_status_t (*skaidb_transaction_fn)(skaidb_client_t *client, void *user);
 skaidb_status_t skaidb_transaction(skaidb_client_t *client, const char *begin, uint32_t attempts,
                                    skaidb_transaction_fn body, void *user);
@@ -352,9 +378,17 @@ char *skaidb_value_to_json_dup(const skaidb_value_t *v);
 skaidb_pool_t *skaidb_pool_new(size_t maxsize, const char *const *endpoints, size_t n_endpoints,
                                const char *username, const char *password,
                                const skaidb_tls_t *tls, const char *database);
+/* The connection is live — an idle one the server closed meanwhile is
+ * dropped, not handed out — and in the pool's own session state. */
 skaidb_status_t skaidb_pool_acquire(skaidb_pool_t *pool, skaidb_client_t **out);
-/* A balanced pool drops a connection a transport error broke, or whose
- * member is ejected, not ready or gone, instead of keeping it idle. */
+/* The next borrower gets the pool's own session state: its database
+ * ("default" when `database` was NULL), no consistency override, no scan
+ * budget, no open transaction. What this borrower changed is put back here
+ * (ROLLBACK, USE, SET SCAN BUDGET DEFAULT, SET CONSISTENCY DEFAULT — only
+ * the ones needed); a connection that cannot be put back (a server before
+ * 0.349 refuses SET CONSISTENCY DEFAULT) or that is gone is closed instead
+ * of kept. A balanced pool also drops one whose member is ejected, not
+ * ready or gone. */
 void skaidb_pool_release(skaidb_pool_t *pool, skaidb_client_t *client);
 size_t skaidb_pool_idle_len(const skaidb_pool_t *pool);
 /* Drops every idle connection and makes acquire fail; stops a balanced

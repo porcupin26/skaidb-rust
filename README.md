@@ -23,7 +23,7 @@ is tested with:
 
 ```toml
 [dependencies]
-skaidb = "0.348"
+skaidb = "0.349"
 ```
 
 Kerberos (GSSAPI) logins are behind the `kerberos` feature, which links the
@@ -32,7 +32,7 @@ MIT krb5 library through `cross-krb5`. Install the development headers first
 macOS and Windows) and enable the feature:
 
 ```toml
-skaidb = { version = "0.348", features = ["kerberos"] }
+skaidb = { version = "0.349", features = ["kerberos"] }
 ```
 
 The feature is off by default and never builds on static musl targets.
@@ -144,17 +144,38 @@ leaderless, so any member serves any statement.
 
 When a statement hits a transport error (broken pipe, reset, EOF) the
 driver dials another endpoint, re-authenticates, re-sends its `Hello`,
-re-enters the bound database — the one given to `with_database` /
-`use_database`, or entered by a `USE <db>` statement sent through
-`execute` — re-applies the scan budget and **retries the
-statement once**. This is transparent, and it means a non-idempotent
-statement can run twice if the node died after applying it but before
-answering. `reconnect()` does the same on demand, for a pool or a caller
-with its own retry policy. Prepared statements do not survive a reconnect;
-see [Prepared statements](#prepared-statements) for how the driver hides
-that. A connection from a [balanced pool](#a-pool-balanced-across-members)
+gives the session its state back (below) and **retries the statement
+once**. This is transparent, and it means a non-idempotent statement can
+run twice if the node died after applying it but before answering.
+`reconnect()` does the same on demand, for a pool or a caller with its own
+retry policy. Prepared statements do not survive a reconnect; see
+[Prepared statements](#prepared-statements) for how the driver hides that.
+A connection from a [balanced pool](#a-pool-balanced-across-members)
 re-dials in the pool's order instead — usable members first (random
 order), the member it just lost last.
+
+A connection the server closed **while it sat idle** — a member's restart,
+a failover, an idle timeout — costs no statement and no retry: before every
+request the driver looks at the socket without waiting (under TLS at the
+transport), finds the close, and replaces the connection before anything
+is written on it. The statement is sent once, on the new one.
+
+**The session's state survives the re-dial.** What a session keeps on its
+connection, the driver notes and gives back to the connection that
+replaces it, before the statement is sent: the database — the one given to
+`with_database` / `use_database`, or entered by a `USE <db>` statement
+sent through `execute` — then a `SET CONSISTENCY …` override, then the
+scan budget (`SET SCAN BUDGET …`, or [`set_scan_budget_rows`](#scan-budget)).
+The last statement of each kind the server accepted is the one kept, and
+`SET … DEFAULT` clears it. If the new connection refuses one of them — the
+database was dropped meanwhile — the statement fails with that error, and
+so does every statement after it: none runs in another database, or under
+other settings, than the application set. The way out is a `USE`: a
+`USE <db>` (or `use_database`) that finds the connection gone is sent
+without entering the old database first.
+
+A **transaction** is the one thing that cannot be given back: while one is
+open a lost connection is not replaced. See [Transactions](#transactions).
 
 ### TLS modes
 
@@ -212,6 +233,12 @@ replica), `Quorum` (a majority of the replicas — the driver's default) or
 `All`. `set_consistency` changes the default for subsequent calls; every
 executing call has a `*_with(…, consistency)` twin that overrides it for
 one statement. DDL always runs at quorum regardless of the level sent.
+
+`SET CONSISTENCY { ONE | QUORUM | ALL }` sent as a statement is something
+else: an override on the server's side of the connection, under which
+every statement runs at that level whatever its request carries, until
+`SET CONSISTENCY DEFAULT` (server ≥ 0.349) clears it. The driver notes it
+and sets it again on a connection that replaces this one.
 
 ```rust
 use skaidb::Consistency;
@@ -448,6 +475,11 @@ Runs `SET SCAN BUDGET ROWS n` (`0` = `SET SCAN BUDGET DEFAULT`) and
 replays it after every reconnect, so a silent failover cannot revert the
 session to node defaults. The budget is tightening-only server-side.
 
+A `SET SCAN BUDGET …` statement sent through `execute` — `ROWS`, `BYTES`
+or both — is the same setting and is replayed the same way: the later of
+the method and the statement is the session's budget, and `SET SCAN BUDGET
+DEFAULT` clears either.
+
 ## Connection pool
 
 ```rust
@@ -473,11 +505,24 @@ impl Pool {
 `Pool` is `Send + Sync`; share it behind an `Arc`. `maxsize` bounds the
 connections kept **idle**, not the number checked out: a burst opens extras
 and the surplus is dropped on return, so callers never block waiting for a
-slot. Idle connections are handed out as-is; a connection the server closed
-while it sat idle re-dials itself on first use, so no liveness probe is
-needed. `close` (and dropping the pool) drops every idle connection and
-makes `acquire` fail; connections checked out at the time are dropped when
-returned.
+slot. A connection the server closed while it sat idle is not handed out:
+`acquire` looks at an idle connection's socket (no round trip) and drops a
+dead one for the next, or a new one. `close` (and dropping the pool) drops
+every idle connection and makes `acquire` fail; connections checked out at
+the time are dropped when returned.
+
+**Every borrower gets the pool's own session state**: the pool's database
+(`default`, where every connection starts, for a pool that names none), no
+consistency override and no scan budget of an earlier borrower, the pool's
+consistency level, and no transaction open. When a connection comes back
+changed, `release` puts it back before it is pooled — `ROLLBACK` for a
+transaction left open, `USE` for the database, `SET SCAN BUDGET DEFAULT`,
+`SET CONSISTENCY DEFAULT` — sending only what is needed, so a borrower
+that changed nothing costs no round trip. A connection that cannot be put
+back (a server before 0.349 refuses `SET CONSISTENCY DEFAULT`; the
+connection is gone) is closed instead of pooled. So a `USE` or a `SET` on a
+pooled connection lasts until that connection is returned; choose the
+pool's database with its `database` option or in its closure.
 
 ### A pool balanced across members
 
@@ -609,7 +654,10 @@ pub struct PoolMember {
 ### A pool from a closure
 
 `Pool::new` builds connections with the closure you supply, so they inherit
-whatever it configures — seeds, TLS, credentials, session database. It
+whatever it configures — seeds, TLS, credentials, session database. The
+state a connection leaves the closure in is the pool's own: its database, a
+scan budget or a consistency override set there, its consistency level are
+what every borrower gets, and what a borrower's change is put back to. It
 knows nothing about members: the most recently returned idle connection
 goes out first, `members()` is empty, and the affinity key of
 `acquire_with_affinity` / `with_affinity` is ignored. `new` panics if
@@ -687,7 +735,9 @@ pub enum DriverError {
 tables, privilege denials, constraint violations, scan-budget refusals,
 `"server does not support pipelined requests"` and so on. `Io` is what a
 failover has already been attempted for (once): if you see it, both the
-original node and every peer failed. `DriverError` implements
+original node and every peer failed — or a transaction was open on the
+connection that was lost, which is never failed over (kind
+`ConnectionAborted`; see [Transactions](#transactions)). `DriverError` implements
 `std::error::Error` and `Display`, and converts `From` `io::Error` and
 `ProtoError`. `is_transaction_conflict()` is true for the `Server` error
 that refuses a `COMMIT` as a conflict — see [Transactions](#transactions).
@@ -732,13 +782,30 @@ let left = client.transaction(3, |c| {
   transaction to a connection with none open, where each statement commits
   on its own; the error is returned instead. Lost under a statement of the
   closure, nothing was committed; lost under the `COMMIT` itself, the
-  outcome is unknown.
+  outcome is unknown, and the error says so.
 
-Written by hand, the same statements go through `execute`. Stop if the
-opening statement fails, and mind the failover: a statement it retries on a
-new connection runs outside the transaction. `ROLLBACK` with no transaction
-open succeeds and does nothing, so sending one from an error path is always
-safe (a server before 0.347 answers an error there).
+Written by hand, the same statements go through `execute`, and the driver
+treats them the same way. It notes the transaction: a statement the server
+accepted whose first word is `BEGIN` opens it, and the answer — success or
+error — to a statement that is exactly `COMMIT [TRANSACTION]` or `ROLLBACK
+[TRANSACTION]` ends it. In between a lost connection is not replaced:
+
+- the statement under which it is lost fails with a connection error
+  (`DriverError::Io`, `ConnectionAborted`), and so does every statement
+  after it — none is sent, on the dead connection or on a new one;
+- `ROLLBACK` ends the transaction there: it succeeds without being sent,
+  because the server discarded the transaction with the connection;
+- `COMMIT` fails, saying that nothing was committed — or, when the
+  connection was lost under the `COMMIT` itself, that the outcome is
+  unknown;
+- after either, the next statement dials as usual. `reconnect()` is
+  refused while the transaction is open.
+
+Stop if the opening statement fails: the statements after it would each
+commit on their own. `ROLLBACK` with no transaction open succeeds and does
+nothing, so sending one from an error path is always safe (a server before
+0.347 answers an error there). A pooled connection returned with a
+transaction open is rolled back by the pool.
 
 ## Client identification and versions
 

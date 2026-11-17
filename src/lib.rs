@@ -7,6 +7,13 @@
 //! transparently reconnects to another endpoint and retries once, so a single
 //! node dying does not take the session down when peers are available.
 //!
+//! What a session keeps on its connection — its database, a consistency
+//! override, a scan budget — the client notes and gives back to every
+//! connection that replaces one (docs/PROTOCOL.md §6, rules 9 and 11). A
+//! transaction cannot be given back: while one is open, begun by
+//! [`Client::transaction`] or by a `BEGIN` statement, a lost connection is
+//! not replaced (rules 7 and 15).
+//!
 //! A [`Pool`] built with [`Pool::builder`] balances its connections across
 //! the cluster's members (policies, health ejection, member discovery and
 //! read-your-writes affinity — docs/PROTOCOL.md §6.1).
@@ -65,6 +72,25 @@ impl DriverError {
     pub fn is_transaction_conflict(&self) -> bool {
         matches!(self, DriverError::Server(msg) if msg.starts_with(TRANSACTION_CONFLICT_PREFIX))
     }
+}
+
+/// The error of a statement that finds its connection lost with a
+/// transaction open (docs/PROTOCOL.md, "Connection lifecycle", rules 7 and
+/// 15): it is not sent, on that connection or on a new one.
+const LOST_IN_TRANSACTION: &str =
+    "connection lost inside a transaction (not replaced: a new connection would have none open)";
+
+/// The error of the `COMMIT` of such a transaction: the connection was
+/// gone before the `COMMIT` could be sent.
+const LOST_BEFORE_COMMIT: &str =
+    "connection lost inside a transaction, before its COMMIT was sent: nothing was committed";
+
+/// The error of a `COMMIT` the connection was lost under.
+const LOST_UNDER_COMMIT: &str = "connection lost under the COMMIT of a transaction: the outcome is \
+     unknown (the server may have applied it before its reply went missing)";
+
+fn lost_transaction(message: impl Into<String>) -> DriverError {
+    DriverError::Io(io::Error::new(io::ErrorKind::ConnectionAborted, message.into()))
 }
 
 /// The prefix of an `AuthOutcome::Denied` reason that is a CAPACITY
@@ -155,15 +181,22 @@ pub struct Client {
     /// Session database, re-applied after every reconnect (see
     /// [`Client::with_database`]). `None` leaves the server default.
     database: Option<String>,
-    /// For a pooled connection: the session database its pool hands it
-    /// out in (`Some(None)` = none). A borrower's `USE` moves `database`;
-    /// the pool puts the connection back before the next borrower gets it
+    /// The session's consistency override: the last `SET CONSISTENCY …`
+    /// statement the server accepted, as it is sent again on every
+    /// connection that replaces this one. `None`: none was set, or `SET
+    /// CONSISTENCY DEFAULT` cleared it.
+    consistency_override: Option<String>,
+    /// The session's scan budget, kept the same way: the last `SET SCAN
+    /// BUDGET …` statement accepted, whether the application sent it or
+    /// [`Client::set_scan_budget_rows`] did — they are one setting. `None`:
+    /// none, or `SET SCAN BUDGET DEFAULT` cleared it. (Tightening-only
+    /// server-side, so sending it again can never widen anything.)
+    scan_budget: Option<String>,
+    /// For a pooled connection: the session state its pool hands it out
+    /// in. A borrower's statements move the fields above; the pool puts
+    /// the connection back before the next borrower gets it
     /// ([`Client::back_home`]).
-    home: Option<Option<String>>,
-    /// Session scan-budget ROWS override, replayed on reconnect like the
-    /// database (`0` = none). Tightening-only server-side, so replaying it
-    /// can never widen anything.
-    scan_budget_rows: u64,
+    home: Option<Home>,
     /// The balanced pool this connection belongs to (see [`Pool::builder`]):
     /// told each round trip's latency, each transport failure and each
     /// write, and asked for the dial order when the connection re-dials.
@@ -172,6 +205,32 @@ pub struct Client {
     /// Set while [`Client::transaction`] has a transaction open: a
     /// connection lost meanwhile is not replaced (see [`Client::reconnect`]).
     in_transaction: bool,
+    /// A transaction the application opened itself is open: the server
+    /// accepted a statement that begins with `BEGIN`, and has answered no
+    /// `COMMIT` or `ROLLBACK` since. A connection lost meanwhile is not
+    /// replaced either.
+    begun: bool,
+    /// No request may be written on `stream`: the peer closed it, a
+    /// request failed on it, or the session on it is not in the state the
+    /// fields above describe. The next statement dials first — or, with a
+    /// transaction open, fails ([`Client::ready`]).
+    lost: bool,
+    /// The connection was dialed for a `USE`, which left the session
+    /// database out ([`Client::redial`]): until a `USE` is answered with
+    /// success the session is in no database the client has noted.
+    unrestored: bool,
+}
+
+/// The session state a pool hands its connections out in: what a
+/// connection had when the pool made it — the pool's database, and
+/// whatever else its options or its closure set.
+#[derive(Debug, Clone)]
+struct Home {
+    database: Option<String>,
+    consistency_override: Option<String>,
+    scan_budget: Option<String>,
+    /// The level requests carry by default ([`Client::set_consistency`]).
+    default_consistency: Consistency,
 }
 
 /// Client-side TLS settings for a [`Client`]: the built rustls config plus the
@@ -390,10 +449,14 @@ impl Client {
                         statements: HashMap::new(),
                         by_text: HashMap::new(),
                         database: None,
+                        consistency_override: None,
+                        scan_budget: None,
                         home: None,
-                        scan_budget_rows: 0,
                         link,
                         in_transaction: false,
+                        begun: false,
+                        lost: false,
+                        unrestored: false,
                     }
                     .said_hello());
                 }
@@ -510,15 +573,14 @@ impl Client {
 
     /// Bind (or rebind) the session database on a live client: `USE` now,
     /// and again after every failover. A refusal (unknown database, no
-    /// privilege) leaves the previous binding and the connection as they
-    /// were.
+    /// privilege) leaves the previous binding as it was.
+    ///
+    /// It is the `USE` statement, sent as [`Client::execute`] sends one
+    /// (the name identifier-quoted, so a database whose name needs quoting
+    /// still works): a connection found closed is replaced first, and that
+    /// connection does not enter the database this call leaves.
     pub fn use_database(&mut self, database: &str) -> Result<(), DriverError> {
-        let previous = self.database.replace(database.to_string());
-        if let Err(e) = self.apply_database() {
-            self.database = previous;
-            return Err(e);
-        }
-        Ok(())
+        self.execute(&use_statement(database)).map(|_| ())
     }
 
     /// The session database, if one was bound.
@@ -526,40 +588,97 @@ impl Client {
         self.database.as_deref()
     }
 
-    /// A connection a pool hands out is in the pool's database for every
-    /// borrower: this one was just made (or configured) by its pool, and
-    /// whatever database it is in now is where it goes back to.
+    /// A connection a pool hands out is in the pool's session state for
+    /// every borrower: this one was just made (or configured) by its pool,
+    /// and whatever state it is in now is where it goes back to.
     fn pooled_here(mut self) -> Client {
-        self.home = Some(self.database.clone());
+        self.home = Some(Home {
+            database: self.database.clone(),
+            consistency_override: self.consistency_override.clone(),
+            scan_budget: self.scan_budget.clone(),
+            default_consistency: self.default_consistency,
+        });
         self
     }
 
-    /// Put a pooled connection back into the database its pool hands it
-    /// out in, after a borrower that entered another (`USE other`, or
-    /// `use_database`) — which this client would otherwise keep, through
-    /// reconnects too, for whoever borrows it next. `false`: it could not
-    /// be put back (the `USE` failed, or the pool's connections are in no
-    /// database, which a session cannot return to) and the pool drops it.
+    /// Put a pooled connection back into the session state its pool hands
+    /// it out in, after a borrower that changed it — which this client
+    /// would otherwise keep, through reconnects too, for whoever borrows
+    /// it next: a transaction left open is rolled back, the pool's
+    /// database entered again (`default`, where every session starts, for
+    /// a pool that names none), then the scan budget and the consistency
+    /// override set back to the pool's, or cleared. Only what the notes
+    /// say the borrower changed is sent, so a borrower that changed
+    /// nothing costs no round trip; and the notes go back with it, so a
+    /// re-dial for the next borrower restores the pool's state.
+    ///
+    /// `false`: it could not be put back — the connection is gone, or a
+    /// statement failed (a server before 0.349 refuses `SET CONSISTENCY
+    /// DEFAULT`) — and the pool drops it. Nothing dials here.
     fn back_home(&mut self) -> bool {
-        match self.home.clone() {
-            None => true,
-            Some(home) if home == self.database => true,
-            Some(Some(db)) => self.use_database(&db).is_ok(),
-            Some(None) => false,
+        let Some(home) = self.home.clone() else {
+            return true;
+        };
+        if self.lost || self.unrestored {
+            return false;
         }
+        self.default_consistency = home.default_consistency;
+        if self.begun || self.in_transaction {
+            if self.session_statement("ROLLBACK").is_err() {
+                return false;
+            }
+            self.begun = false;
+            self.in_transaction = false;
+        }
+        let default = |database: &Option<String>| database.clone().unwrap_or_else(|| "default".into());
+        if default(&self.database) != default(&home.database)
+            && self.session_statement(&use_statement(&default(&home.database))).is_err()
+        {
+            return false;
+        }
+        self.database = home.database;
+        if self.scan_budget != home.scan_budget {
+            let back = home.scan_budget.as_deref().unwrap_or("SET SCAN BUDGET DEFAULT");
+            if self.session_statement(back).is_err() {
+                return false;
+            }
+            self.scan_budget = home.scan_budget;
+        }
+        if self.consistency_override != home.consistency_override {
+            let back = home.consistency_override.as_deref().unwrap_or("SET CONSISTENCY DEFAULT");
+            if self.session_statement(back).is_err() {
+                return false;
+            }
+            self.consistency_override = home.consistency_override;
+        }
+        true
     }
 
-    /// Issue `USE` for the bound database on the CURRENT connection. Sends
-    /// through `roundtrip` rather than `execute`, so a failure here cannot
-    /// recurse back into reconnect. The name is identifier-quoted, so a
-    /// database whose name needs quoting still works.
-    fn apply_database(&mut self) -> Result<(), DriverError> {
-        let Some(db) = self.database.clone() else {
-            return Ok(());
-        };
-        let sql = format!("USE \"{}\"", db.replace('"', "\"\""));
+    /// Give the session on a connection just dialed its state back,
+    /// before anything else is sent on it: the database, then the noted
+    /// `SET CONSISTENCY`, then the noted `SET SCAN BUDGET` — each only if
+    /// there is one. `entering`: the statement this dial is made for is
+    /// itself a `USE`, and the database it leaves is not entered first.
+    /// That database may be gone, dropped while the connection was down;
+    /// entered first, its error would fail every statement from then on,
+    /// the `USE` that leaves it included.
+    fn restore_session(&mut self, entering: bool) -> Result<(), DriverError> {
+        if let (false, Some(database)) = (entering, &self.database) {
+            self.session_statement(&use_statement(database))?;
+        }
+        let settings = [self.consistency_override.clone(), self.scan_budget.clone()];
+        for setting in settings.into_iter().flatten() {
+            self.session_statement(&setting)?;
+        }
+        Ok(())
+    }
+
+    /// Send a statement that sets the session's state on the CURRENT
+    /// connection, through `roundtrip` rather than `execute`: a failure
+    /// here cannot recurse back into a re-dial.
+    fn session_statement(&mut self, sql: &str) -> Result<(), DriverError> {
         self.roundtrip(&ClientRequest::Query {
-            sql,
+            sql: sql.to_string(),
             consistency: self.default_consistency,
         })?;
         Ok(())
@@ -591,30 +710,17 @@ impl Client {
     /// reconnect — without the replay, a silent reconnect reverts the
     /// session to node defaults with nothing in the logs. `0` clears
     /// (`SET SCAN BUDGET DEFAULT`).
+    ///
+    /// It is that statement, sent as [`Client::execute`] sends one, so it
+    /// and a `SET SCAN BUDGET …` the application sends itself are one
+    /// setting: the later of the two is the session's.
     pub fn set_scan_budget_rows(&mut self, rows: u64) -> Result<(), DriverError> {
         let sql = if rows == 0 {
             "SET SCAN BUDGET DEFAULT".to_string()
         } else {
             format!("SET SCAN BUDGET ROWS {rows}")
         };
-        self.roundtrip(&ClientRequest::Query {
-            sql,
-            consistency: self.default_consistency,
-        })?;
-        self.scan_budget_rows = rows;
-        Ok(())
-    }
-
-    fn apply_scan_budget(&mut self) -> Result<(), DriverError> {
-        if self.scan_budget_rows == 0 {
-            return Ok(());
-        }
-        let sql = format!("SET SCAN BUDGET ROWS {}", self.scan_budget_rows);
-        self.roundtrip(&ClientRequest::Query {
-            sql,
-            consistency: self.default_consistency,
-        })?;
-        Ok(())
+        self.execute(&sql).map(|_| ())
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<Response, DriverError> {
@@ -650,9 +756,10 @@ impl Client {
     /// it is, never retried. If the `BEGIN` is refused, `body` does not
     /// run. A connection lost while the transaction is open is not
     /// replaced, and the error is returned: lost under a statement of
-    /// `body`, nothing was committed; lost under the `COMMIT` itself, the
-    /// outcome is unknown — the server may have applied it before its
-    /// reply went missing.
+    /// `body`, nothing was committed, and the error of the `COMMIT` says
+    /// so if `body` went on to return normally; lost under the `COMMIT`
+    /// itself, the outcome is unknown — the server may have applied it
+    /// before its reply went missing — and the error says that.
     ///
     /// `body` runs once per attempt: keep what it does outside the
     /// database repeatable. On a cluster, open with
@@ -676,7 +783,10 @@ impl Client {
         let mut left = attempts.max(1);
         loop {
             // Refused: nothing is open, and continuing would autocommit
-            // every statement of the body.
+            // every statement of the body. (Accepted, the `BEGIN` is
+            // noted like one the application sends, and the `COMMIT` or
+            // `ROLLBACK` below ends that note: one transaction, held by
+            // the flag here for as long as this call has it open.)
             self.execute(begin)?;
             self.in_transaction = true;
             let out = body(self);
@@ -686,13 +796,13 @@ impl Client {
                     // Whatever the ROLLBACK answers, the caller hears the
                     // error that caused it. (On a lost connection it is
                     // not sent anywhere: the transaction died with it.)
-                    let _ = self.try_execute("ROLLBACK", self.default_consistency);
+                    let _ = self.execute("ROLLBACK");
                     self.in_transaction = false;
                     return Err(e);
                 }
             };
             left -= 1;
-            let committed = self.try_execute("COMMIT", self.default_consistency);
+            let committed = self.execute("COMMIT");
             // A COMMIT that failed has ended the transaction too.
             self.in_transaction = false;
             match committed {
@@ -705,21 +815,42 @@ impl Client {
 
     /// Execute a statement at an explicit consistency level. If the live
     /// connection has dropped, fail over to another endpoint and retry once.
+    ///
+    /// A connection the peer closed while it sat idle is found before the
+    /// statement is written and replaced first, so the statement is sent
+    /// once. One that fails under the statement is replaced and the
+    /// statement sent again — it may have run already. With a transaction
+    /// open neither happens: the transaction was lost with the connection,
+    /// every statement fails with the connection error, and the
+    /// application ends it — its `ROLLBACK` succeeds without being sent,
+    /// its `COMMIT` fails saying nothing was committed (or, lost under the
+    /// `COMMIT` itself, that the outcome is unknown).
     pub fn execute_with(
         &mut self,
         sql: &str,
         consistency: Consistency,
     ) -> Result<Response, DriverError> {
+        let change = session_change(sql);
+        if let Some(answered) = self.ready(change.as_ref())? {
+            return Ok(answered);
+        }
         let out = match self.try_execute(sql, consistency) {
             // A broken pipe / reset / EOF means the node went away — try a peer.
-            Err(DriverError::Io(_)) => {
-                self.reconnect()?;
-                self.try_execute(sql, consistency)
-            }
+            Err(DriverError::Io(e)) => match self.lost_under(&e, change.as_ref())? {
+                Some(answered) => return Ok(answered),
+                None => self.try_execute(sql, consistency),
+            },
             other => other,
         };
-        if out.is_ok() {
-            self.observe_statement(sql);
+        match &out {
+            Ok(_) => self.accepted(sql, change),
+            Err(DriverError::Server(_)) => self.note(change, false),
+            Err(_) => {}
+        }
+        // A `USE` whose dial left the session database out, and which was
+        // not answered with success: the session is in neither database.
+        if std::mem::take(&mut self.unrestored) {
+            self.lose();
         }
         out
     }
@@ -760,8 +891,11 @@ impl Client {
     /// failures come back **inline** as [`Response::Error`] entries — a
     /// failed statement does not stop the ones after it. The whole batch is
     /// retried once on a fresh connection if the node dies mid-flight (same
-    /// idempotency caveat as [`Client::execute_with`]). Servers older than
-    /// the tagged-request opcode fail the batch with "server too old".
+    /// idempotency caveat as [`Client::execute_with`]) — unless a
+    /// transaction was open when the batch was sent: then the batch fails
+    /// with the connection error, like any statement of a lost
+    /// transaction. Servers older than the tagged-request opcode fail the
+    /// batch with "server too old".
     pub fn pipeline_with(
         &mut self,
         stmts: &[&str],
@@ -770,16 +904,19 @@ impl Client {
         if stmts.is_empty() {
             return Ok(Vec::new());
         }
+        self.ready(None)?;
         let out = match self.try_pipeline(stmts, consistency) {
-            Err(DriverError::Io(_)) => {
-                self.reconnect()?;
+            Err(DriverError::Io(e)) => {
+                self.lost_under(&e, None)?;
                 self.try_pipeline(stmts, consistency)
             }
             other => other,
         };
         if let Ok(responses) = &out {
             for (sql, resp) in stmts.iter().zip(responses) {
-                if !matches!(resp, Response::Error(_)) {
+                if matches!(resp, Response::Error(_)) {
+                    self.note(session_change(sql), false);
+                } else {
                     self.observe_statement(sql);
                 }
             }
@@ -847,9 +984,10 @@ impl Client {
         let req = ClientRequest::Prepare {
             sql: sql.to_string(),
         };
+        self.ready(None)?;
         match self.roundtrip(&req) {
-            Err(DriverError::Io(_)) => {
-                self.reconnect()?;
+            Err(DriverError::Io(e)) => {
+                self.lost_under(&e, None)?;
                 self.roundtrip(&req)
             }
             other => other,
@@ -952,14 +1090,15 @@ impl Client {
         params: &[Value],
         consistency: Consistency,
     ) -> Result<Response, DriverError> {
+        self.ready(None)?;
         let req = ClientRequest::Execute {
             id: self.live_statement(stmt)?,
             params: params.to_vec(),
             consistency,
         };
         let out = match self.roundtrip(&req) {
-            Err(DriverError::Io(_)) => {
-                self.reconnect()?;
+            Err(DriverError::Io(e)) => {
+                self.lost_under(&e, None)?;
                 *stmt = self.prepare(&stmt.sql)?;
                 self.roundtrip(&ClientRequest::Execute {
                     id: stmt.id,
@@ -986,14 +1125,15 @@ impl Client {
         rows: Vec<Vec<Value>>,
     ) -> Result<u64, DriverError> {
         let consistency = self.default_consistency;
+        self.ready(None)?;
         let req = ClientRequest::ExecuteBatch {
             id: self.live_statement(stmt)?,
             rows: rows.clone(),
             consistency,
         };
         let resp = match self.roundtrip(&req) {
-            Err(DriverError::Io(_)) => {
-                self.reconnect()?;
+            Err(DriverError::Io(e)) => {
+                self.lost_under(&e, None)?;
                 *stmt = self.prepare(&stmt.sql)?;
                 self.roundtrip(&ClientRequest::ExecuteBatch {
                     id: stmt.id,
@@ -1050,30 +1190,221 @@ impl Client {
     /// unusable until a re-dial, and the member it reached gets a strike.
     fn transport<T>(&mut self, r: io::Result<T>) -> Result<T, DriverError> {
         r.map_err(|e| {
-            if let Some(link) = &mut self.link {
-                link.broken = true;
-                link.pool.failed(&self.connected);
-            }
+            self.failed();
             DriverError::Io(e)
         })
     }
 
-    /// A statement succeeded: a pool with read-your-writes on remembers
-    /// which member took a write, and a `USE` binds the session database
-    /// exactly as [`Client::use_database`] does — the connection that
-    /// replaces this one re-enters it. Sent as a plain statement it used to
-    /// be the server's knowledge alone: after a failover the session was
-    /// back in no database, and the next statement ran against whatever
-    /// table of that name the default database held (or was refused for
-    /// it), with nothing to say the connection had changed.
-    fn observe_statement(&mut self, sql: &str) {
-        if let Some(database) = used_database(sql) {
-            self.database = Some(database);
+    /// The connection failed, or was found closed by its peer: it is lost,
+    /// and inside a balanced pool that is one more transport failure of
+    /// the member it reached.
+    fn failed(&mut self) {
+        self.lose();
+        if let Some(link) = &mut self.link {
+            link.broken = true;
+            link.pool.failed(&self.connected);
         }
+    }
+
+    /// No request may be written on this connection any more: it is gone,
+    /// or its session is not in the state the client has noted. Its socket
+    /// is shut down now, not when the next statement replaces it — that
+    /// ends the session on the server, and with it a transaction open
+    /// there and the rows it holds.
+    fn lose(&mut self) {
+        self.lost = true;
+        let _ = self.stream.tcp().shutdown(std::net::Shutdown::Both);
+    }
+
+    /// Whether the peer has closed this connection while it sat idle —
+    /// asked of the socket without waiting, and without a round trip. A
+    /// member's restart, a failover or an idle timeout closes idle
+    /// connections, and on a real network the first write to such a
+    /// socket still succeeds (the reset has not come back yet): only the
+    /// read fails, after the statement has left. The server sends nothing
+    /// on an idle connection, so a socket that is readable holds the
+    /// peer's close, a reset or bytes nobody asked for, and after any of
+    /// them it cannot carry a request.
+    ///
+    /// Under TLS the look is at the transport too, and TLS has records of
+    /// its own there (a session ticket, a key update): what the socket
+    /// holds is handed to the TLS session, which takes those and tells
+    /// them from a close or from data.
+    fn peer_gone(&mut self) -> bool {
+        // Without the socket's non-blocking mode there is no look that
+        // does not wait: the connection is taken for live, and a dead one
+        // is found by the request.
+        if self.stream.tcp().set_nonblocking(true).is_err() {
+            return false;
+        }
+        let gone = match &mut self.stream {
+            skaidb_net::Stream::Plain(tcp) => loop {
+                match tcp.peek(&mut [0u8; 1]) {
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break false,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    // The end of the stream, bytes nobody asked for, a reset.
+                    Ok(_) | Err(_) => break true,
+                }
+            },
+            skaidb_net::Stream::ClientTls(tls) => {
+                let rustls::StreamOwned { conn, sock } = &mut **tls;
+                loop {
+                    // Data nobody read, or the peer's `close_notify`.
+                    if !conn.wants_read() {
+                        break true;
+                    }
+                    match conn.read_tls(sock) {
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break false,
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Ok(0) | Err(_) => break true,
+                        Ok(_) => {
+                            if conn.process_new_packets().is_err() {
+                                break true;
+                            }
+                        }
+                    }
+                }
+            }
+            // The accepting side of a connection: never a client's.
+            skaidb_net::Stream::ServerTls(_) => false,
+        };
+        let _ = self.stream.tcp().set_nonblocking(false);
+        gone
+    }
+
+    /// Whether this connection, idle until now, can no longer carry a
+    /// request: it was lost before, or a look at its socket
+    /// ([`Client::peer_gone`]) finds that the peer has closed it since.
+    fn gone_while_idle(&mut self) -> bool {
+        if !self.lost && self.peer_gone() {
+            self.failed();
+        }
+        self.lost
+    }
+
+    /// Before the first request of a statement is written: the connection
+    /// must be one that can carry it. `change` is what the statement does
+    /// to the session's state ([`session_change`]).
+    ///
+    /// A connection found closed while it sat idle
+    /// ([`Client::gone_while_idle`]) is replaced here, before anything was
+    /// written on it, so the statement is sent once — on a connection the
+    /// session's state has been given back to ([`Client::redial`]).
+    ///
+    /// With a transaction open it is not replaced (docs/PROTOCOL.md §6,
+    /// rules 7 and 15): the transaction was lost with it, and on a new
+    /// connection the statement would commit on its own. The statement
+    /// fails with the connection error and nothing is sent — except that
+    /// the application ends the transaction here: its `ROLLBACK` is
+    /// answered with success (`Some`: the server discarded the transaction
+    /// with the connection), its `COMMIT` fails saying that nothing was
+    /// committed. Either one ends the note, and the statement after it
+    /// dials as usual.
+    fn ready(&mut self, change: Option<&SessionChange>) -> Result<Option<Response>, DriverError> {
+        if std::mem::take(&mut self.unrestored) {
+            // The `USE` this connection was dialed for was never answered.
+            self.lose();
+        }
+        if !self.gone_while_idle() {
+            return Ok(None);
+        }
+        if self.in_transaction || self.begun {
+            return match change {
+                Some(SessionChange::Rollback) => {
+                    self.begun = false;
+                    Ok(Some(Response::Ddl))
+                }
+                Some(SessionChange::Commit) => {
+                    self.begun = false;
+                    Err(lost_transaction(LOST_BEFORE_COMMIT))
+                }
+                _ => Err(lost_transaction(LOST_IN_TRANSACTION)),
+            };
+        }
+        self.redial(matches!(change, Some(SessionChange::Use(_))))?;
+        Ok(None)
+    }
+
+    /// The connection failed (`error`) under a statement that had been
+    /// sent. Outside a transaction it is replaced, and the caller sends
+    /// the statement once more (`None`).
+    ///
+    /// With a transaction open it is not replaced and the statement is not
+    /// sent again. Under the `COMMIT` itself the outcome is unknown — the
+    /// server may have applied it before its reply went missing — and the
+    /// error says so; under the `ROLLBACK` the transaction is gone either
+    /// way, which is what was asked (`Some`). Both end the note. Under any
+    /// other statement nothing was committed, and the transaction stays
+    /// noted until the application ends it ([`Client::ready`]).
+    fn lost_under(
+        &mut self,
+        error: &io::Error,
+        change: Option<&SessionChange>,
+    ) -> Result<Option<Response>, DriverError> {
+        if self.in_transaction || self.begun {
+            return match change {
+                Some(SessionChange::Commit) => {
+                    self.begun = false;
+                    Err(lost_transaction(format!("{LOST_UNDER_COMMIT} ({error})")))
+                }
+                Some(SessionChange::Rollback) => {
+                    self.begun = false;
+                    Ok(Some(Response::Ddl))
+                }
+                _ => Err(lost_transaction(LOST_IN_TRANSACTION)),
+            };
+        }
+        self.redial(matches!(change, Some(SessionChange::Use(_))))?;
+        Ok(None)
+    }
+
+    /// A statement succeeded: a pool with read-your-writes on remembers
+    /// which member took a write, and what the statement set of the
+    /// session's state is noted ([`Client::note`]).
+    fn observe_statement(&mut self, sql: &str) {
+        self.accepted(sql, session_change(sql));
+    }
+
+    /// [`Client::observe_statement`] for a statement already read.
+    fn accepted(&mut self, sql: &str, change: Option<SessionChange>) {
+        self.note(change, true);
         if let Some(link) = &self.link {
             if link.out && link.pool.read_your_writes() && is_write(sql) {
                 link.pool.wrote(link.affinity.clone(), &self.connected);
             }
+        }
+    }
+
+    /// The server answered a statement that changes the state of its
+    /// session — with success (`accepted`) or with an error.
+    ///
+    /// What a statement answered with success set is the session's from
+    /// then on, exactly as if [`Client::use_database`] or
+    /// [`Client::set_scan_budget_rows`] had set it: the connection that
+    /// replaces this one is given it back. Sent as plain statements a
+    /// `USE` and a `SET` used to be the server's knowledge alone: after a
+    /// failover the session was back in no database and under no setting,
+    /// and the next statement ran against whatever table of that name the
+    /// default database held (or was refused for it), at the request's own
+    /// consistency and with no scan limit, with nothing to say the
+    /// connection had changed.
+    ///
+    /// A transaction is noted from a `BEGIN` answered with success until
+    /// its `COMMIT` or `ROLLBACK` is answered at all — a `COMMIT` the
+    /// server refuses has ended it too. It is not given back to a new
+    /// connection; it cannot be.
+    fn note(&mut self, change: Option<SessionChange>, accepted: bool) {
+        match change {
+            Some(SessionChange::Commit | SessionChange::Rollback) => self.begun = false,
+            _ if !accepted => {}
+            Some(SessionChange::Use(database)) => {
+                self.database = Some(database);
+                self.unrestored = false;
+            }
+            Some(SessionChange::Consistency(setting)) => self.consistency_override = setting,
+            Some(SessionChange::ScanBudget(setting)) => self.scan_budget = setting,
+            Some(SessionChange::Begin) => self.begun = true,
+            None => {}
         }
     }
 
@@ -1092,7 +1423,8 @@ impl Client {
     ///
     /// The returned [`RowStream`] borrows the connection exclusively until it
     /// is drained or dropped (dropping it reads and discards the rest of the
-    /// stream). Failover applies only to sending the request; an endpoint
+    /// stream). Failover applies only to sending the request — a connection
+    /// found closed before it, or failing under the write; an endpoint
     /// dying mid-stream surfaces as an error from the iterator, and the caller
     /// decides whether to re-run the query. Servers older than the
     /// `QueryStream` opcode reject it with a server error; use
@@ -1132,27 +1464,42 @@ impl Client {
             params: params.to_vec(),
             consistency,
         };
+        let change = session_change(sql);
+        if self.ready(change.as_ref())?.is_some() {
+            // The ROLLBACK of a transaction lost with its connection.
+            return Ok(self.answered_here());
+        }
         let mut started = Instant::now();
         let sent = write_frame(&mut self.stream, &req.encode());
-        if self.transport(sent).is_err() {
+        if let Err(DriverError::Io(e)) = self.transport(sent) {
             // The node died since the last use — fail over before the stream
             // starts, like execute() does.
-            self.reconnect()?;
+            if self.lost_under(&e, change.as_ref())?.is_some() {
+                return Ok(self.answered_here());
+            }
             started = Instant::now();
             let sent = write_frame(&mut self.stream, &req.encode());
             self.transport(sent)?;
         }
         let frame = read_frame(&mut self.stream);
-        let payload = self.observed(started, frame)?;
+        let payload = match self.observed(started, frame) {
+            // Lost under the statement with a transaction open: answered
+            // as `execute` answers it. (Outside one a stream is not sent
+            // again once its request has left.)
+            Err(DriverError::Io(e)) if self.in_transaction || self.begun => {
+                self.lost_under(&e, change.as_ref())?;
+                return Ok(self.answered_here());
+            }
+            other => other?,
+        };
         let resp = Response::decode(&payload)?;
-        if matches!(
-            resp,
+        match &resp {
             Response::RowsHeader { .. }
-                | Response::Mutation { .. }
-                | Response::Ddl
-                | Response::ResultSets { .. }
-        ) {
-            self.observe_statement(sql);
+            | Response::Mutation { .. }
+            | Response::Ddl
+            | Response::ResultSets { .. } => self.accepted(sql, change),
+            Response::Error(_) => self.note(change, false),
+            _ => {}
         }
         match resp {
             Response::Error(msg) => Err(DriverError::Server(msg)),
@@ -1204,15 +1551,30 @@ impl Client {
         }
     }
 
+    /// The stream of a statement that was answered without being sent (the
+    /// `ROLLBACK` of a transaction lost with its connection): no rows.
+    fn answered_here(&mut self) -> RowStream<'_> {
+        RowStream {
+            client: self,
+            columns: Vec::new(),
+            affected: 0,
+            chunk: Vec::new().into_iter(),
+            more: Vec::new().into_iter(),
+            done: true,
+        }
+    }
+
     /// Re-establish the connection after a failure, preferring a *different*
     /// node than the one that just died, then falling back to any reachable one.
     ///
     /// Called automatically when a statement hits a transport error; public so
     /// a pool (or a caller that owns its own retry policy) can recycle a
     /// connection deliberately, as the Python driver's `reconnect()` allows.
-    /// Re-authenticates and re-enters the bound database
-    /// ([`Client::with_database`]); prepared statements do not survive, since
-    /// a statement id is only valid on the connection that created it.
+    /// Re-authenticates and gives the session its state back — the bound
+    /// database ([`Client::with_database`]), the consistency override and
+    /// the scan budget; prepared statements do not survive, since a
+    /// statement id is only valid on the connection that created it.
+    /// Refused while a transaction is open on the connection.
     pub fn reconnect(&mut self) -> Result<(), DriverError> {
         // A transaction lives on the connection that began it. Replaced
         // mid-transaction, the new connection has none open: every
@@ -1222,12 +1584,24 @@ impl Client {
         // (It says nothing about the outcome: lost under a statement of
         // the body, nothing was committed; lost under the COMMIT itself,
         // the server may have applied it before the reply went missing.)
-        if self.in_transaction {
-            return Err(DriverError::Io(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "connection lost inside a transaction (not replaced: a new connection would have none open)",
-            )));
+        if self.in_transaction || self.begun {
+            return Err(lost_transaction(LOST_IN_TRANSACTION));
         }
+        self.redial(false)
+    }
+
+    /// Replace the connection: dial, authenticate, and give the session
+    /// its state back ([`Client::restore_session`]) before anything else
+    /// runs on the new socket. `entering`: the dial is made for a `USE`,
+    /// and leaves the session database to it.
+    ///
+    /// If the state cannot be given back — the server refuses the `USE`,
+    /// or a setting — that error is returned and the new connection is
+    /// not kept: a statement never runs in another database, or under
+    /// other settings, than the application set, so the next one dials
+    /// again and fails the same way until the state can be restored (or a
+    /// `USE` moves the session elsewhere).
+    fn redial(&mut self, entering: bool) -> Result<(), DriverError> {
         let ordered = match &self.link {
             // Pooled: the pool's current order — usable members first, the
             // member this connection just lost last.
@@ -1256,6 +1630,8 @@ impl Client {
                     self.by_text.clear();
                     self.connected = ep.clone();
                     self.endpoints = ordered;
+                    self.lost = false;
+                    self.unrestored = false;
                     if let Some(link) = &mut self.link {
                         // The connection now counts against the member it
                         // reached.
@@ -1263,12 +1639,14 @@ impl Client {
                         let pool = link.pool.clone();
                         pool.moved(link, &self.connected);
                     }
-                    // Re-identify, re-enter the session database and
-                    // re-tighten the scan budget before anything else runs
-                    // on this socket.
+                    // Re-identify, then the session's state, before
+                    // anything else runs on this socket.
                     self.send_hello();
-                    self.apply_database()?;
-                    self.apply_scan_budget()?;
+                    if let Err(e) = self.restore_session(entering) {
+                        self.lose();
+                        return Err(e);
+                    }
+                    self.unrestored = entering && self.database.is_some();
                     return Ok(());
                 }
                 Err(e) => {
@@ -1657,6 +2035,12 @@ fn handshake<S: io::Read + io::Write>(
 ///   database; the most recently returned idle connection is handed out
 ///   first and the pool knows nothing about members.
 ///
+/// Either way every borrower gets a connection in the pool's own session
+/// state — its database (`default` for a pool that names none), no
+/// consistency override, scan budget or open transaction of an earlier
+/// borrower — and one that is live (docs/PROTOCOL.md §6, rules 12 and 13;
+/// see [`Pool::release`] and [`Pool::acquire`]).
+///
 /// ```no_run
 /// # use skaidb::{LoadBalancing, Pool};
 /// let pool = Pool::builder(&["h1:7000", "h2:7000", "h3:7000"])
@@ -1756,24 +2140,33 @@ impl Pool {
 
     /// Check out a connection, reusing an idle one when possible.
     ///
-    /// Idle connections are handed out as-is: `Client` re-dials by itself when
-    /// a statement hits a dead socket, so a connection the server closed while
-    /// it sat idle recovers on first use rather than needing a liveness probe
-    /// here. A balanced pool hands out an idle connection to the member its
-    /// policy picks, or dials that member (falling back to the others).
+    /// The connection is in the pool's own session state, whatever its
+    /// last borrower did with it (see [`Pool::release`]), and it is live:
+    /// an idle connection the peer closed while it sat in the pool — a
+    /// look at its socket tells, without a round trip — is dropped, not
+    /// handed out. A balanced pool hands out an idle connection to the
+    /// member its policy picks, or dials that member (falling back to the
+    /// others).
     pub fn acquire(&self) -> Result<Client, DriverError> {
         match &self.inner {
             PoolInner::Factory { make, idle, closed, .. } => {
                 if *closed.lock().map_err(|_| DriverError::NoEndpoint("pool poisoned".into()))? {
                     return Err(DriverError::NoEndpoint("pool is closed".into()));
                 }
-                let reused = idle
-                    .lock()
-                    .map_err(|_| DriverError::NoEndpoint("pool poisoned".into()))?
-                    .pop();
-                match reused {
-                    Some(c) => Ok(c),
-                    None => make().map(Client::pooled_here),
+                loop {
+                    let reused = idle
+                        .lock()
+                        .map_err(|_| DriverError::NoEndpoint("pool poisoned".into()))?
+                        .pop();
+                    match reused {
+                        Some(mut c) => {
+                            // (Closed by its peer while idle: the next one.)
+                            if !c.gone_while_idle() {
+                                return Ok(c);
+                            }
+                        }
+                        None => return make().map(Client::pooled_here),
+                    }
                 }
             }
             PoolInner::Balanced(b) => b.checkout(None),
@@ -1799,16 +2192,21 @@ impl Pool {
         }
     }
 
-    /// Return a connection, dropping it if the pool is closed or full. A
-    /// balanced pool also drops a connection a transport error left broken,
-    /// one whose member is ejected, not `ready` or gone, and one it did not
-    /// hand out.
+    /// Return a connection, dropping it if the pool is closed or full.
+    ///
+    /// The next borrower gets it in the pool's own session state — the
+    /// pool's database (`default` for a pool that names none), no
+    /// consistency override and no scan budget beyond what the pool's own
+    /// options or closure set, no transaction open. What this borrower
+    /// changed is put back here (`ROLLBACK`, `USE`, `SET SCAN BUDGET
+    /// DEFAULT`, `SET CONSISTENCY DEFAULT` — only the ones needed), and a
+    /// connection that cannot be put back, or that is gone, is dropped
+    /// instead of kept. A balanced pool also drops one whose member is
+    /// ejected, not `ready` or gone, and one it did not hand out.
     pub fn release(&self, mut client: Client) {
         match &self.inner {
             PoolInner::Factory { maxsize, idle, closed, .. } => {
                 let closed = closed.lock().map(|c| *c).unwrap_or(true);
-                // (A connection its borrower left in another database goes
-                // back into the pool's own, or is dropped.)
                 if closed || !client.back_home() {
                     return;
                 }
@@ -2354,6 +2752,82 @@ fn used_database(sql: &str) -> Option<String> {
     bare.then(|| rest.to_string())
 }
 
+/// The `USE` statement that enters `database`, its name identifier-quoted.
+fn use_statement(database: &str) -> String {
+    format!("USE \"{}\"", database.replace('"', "\"\""))
+}
+
+/// What a statement does to the state of its session, when it is one the
+/// driver notes (docs/PROTOCOL.md §6, rules 9, 11 and 15). That state
+/// lives on the connection, so the driver keeps a note of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionChange {
+    /// `USE [DATABASE] <name>`: the session database ([`used_database`]).
+    Use(String),
+    /// `SET CONSISTENCY …`: the statement, to send again as it is — its
+    /// comments and trailing `;` stripped. `None` for `SET CONSISTENCY
+    /// DEFAULT`, which clears the override.
+    Consistency(Option<String>),
+    /// `SET SCAN BUDGET …`, kept the same way; `None` for `… DEFAULT`.
+    ScanBudget(Option<String>),
+    /// A statement whose first word is `BEGIN` (`BEGIN`, `BEGIN
+    /// TRANSACTION`, `BEGIN ATOMIC …`): it opens a transaction.
+    Begin,
+    /// Exactly `COMMIT [TRANSACTION]`, which ends it,
+    Commit,
+    /// or exactly `ROLLBACK [TRANSACTION]`.
+    Rollback,
+}
+
+/// The first word of every statement the driver notes.
+const SESSION_WORDS: [&str; 5] = ["USE", "SET", "BEGIN", "COMMIT", "ROLLBACK"];
+
+/// What `sql` does to the state of its session, when it is exactly one
+/// statement of a kind the driver notes ([`SessionChange`]). The driver
+/// reads the first words and no further — keywords in any case, any
+/// whitespace between them, a trailing `;`, `--` comments skipped as the
+/// server skips them — and leaves alone whatever it cannot read so.
+fn session_change(sql: &str) -> Option<SessionChange> {
+    // Any other statement is told apart by its first word, without a pass
+    // over its text. (One that opens with a comment is read in full.)
+    let head = sql.trim_start();
+    if !head.starts_with("--") {
+        let word = head.split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("");
+        if !SESSION_WORDS.iter().any(|w| word.eq_ignore_ascii_case(w)) {
+            return None;
+        }
+    }
+    if let Some(database) = used_database(sql) {
+        return Some(SessionChange::Use(database));
+    }
+    let text = without_line_comments(sql);
+    let text = text.trim();
+    let text = text.strip_suffix(';').unwrap_or(text).trim_end();
+    let words: Vec<&str> = text.split_whitespace().take(5).collect();
+    let is = |at: usize, word: &str| words.get(at).is_some_and(|w| w.eq_ignore_ascii_case(word));
+    if is(0, "BEGIN") {
+        return Some(SessionChange::Begin);
+    }
+    for (word, end) in [("COMMIT", SessionChange::Commit), ("ROLLBACK", SessionChange::Rollback)] {
+        if is(0, word) && (words.len() == 1 || (words.len() == 2 && is(1, "TRANSACTION"))) {
+            return Some(end);
+        }
+    }
+    // More than one statement is none the driver reads.
+    if text.contains(';') {
+        return None;
+    }
+    // `DEFAULT` clears the setting, and with it the note.
+    let kept = |level: usize| (!is(level, "DEFAULT")).then(|| text.to_string());
+    if is(0, "SET") && is(1, "CONSISTENCY") {
+        return Some(SessionChange::Consistency(kept(2)));
+    }
+    if is(0, "SET") && is(1, "SCAN") && is(2, "BUDGET") {
+        return Some(SessionChange::ScanBudget(kept(3)));
+    }
+    None
+}
+
 /// `sql` without its `--` comments (each runs to the end of its line),
 /// leaving alone a `--` inside a double-quoted name or a quoted string.
 /// The server accepts `USE app -- the app database`, and a `USE` the
@@ -2587,7 +3061,8 @@ impl Balancer {
     // -- checkout / checkin --
 
     fn checkout(self: &Arc<Self>, affinity: Option<&str>) -> Result<Client, DriverError> {
-        for _ in 0..CHECKOUT_ATTEMPTS {
+        let mut dials = 0;
+        while dials < CHECKOUT_ATTEMPTS {
             let (idle, stale, order) = {
                 let mut guard = self.lock();
                 let st = &mut *guard;
@@ -2605,8 +3080,16 @@ impl Balancer {
             // Connections to members no longer usable close outside the lock.
             drop(stale);
             let mut client = match idle {
-                Some(c) => c,
+                Some(mut c) => {
+                    // One the peer closed while it sat idle is not handed
+                    // out: the next idle one is, or a member is dialed.
+                    if c.gone_while_idle() {
+                        continue;
+                    }
+                    c
+                }
                 None => {
+                    dials += 1;
                     let mut c = self.dial(order, true)?;
                     self.discover_through(&mut c);
                     if c.link.as_ref().is_some_and(|l| l.broken) {
@@ -2630,8 +3113,8 @@ impl Balancer {
     }
 
     fn checkin(&self, mut client: Client) {
-        // Before the lock (it may send a `USE`): back in the pool's
-        // database, whatever the borrower entered.
+        // Before the lock (it may send statements): back in the pool's
+        // session state, whatever the borrower did to it.
         let home = client.back_home();
         let mut guard = self.lock();
         let st = &mut *guard;
@@ -2819,7 +3302,8 @@ impl Balancer {
 
     /// Dial a connection across `order` with the pool's login, consistency
     /// and database. `pooled` ties it to the pool (failed dials reported); a
-    /// probe dials untied.
+    /// probe dials untied. Either way the state it is in now is the one
+    /// every borrower gets it in: a probe's connection joins the idle set.
     fn dial(self: &Arc<Self>, order: Vec<String>, pooled: bool) -> Result<Client, DriverError> {
         let link = pooled.then(|| PoolLink::new(self.clone()));
         let mut client = Client::open(order, &self.login, link)?;
@@ -2827,7 +3311,7 @@ impl Balancer {
         if let Some(db) = &self.database {
             client.use_database(db)?;
         }
-        Ok(if pooled { client.pooled_here() } else { client })
+        Ok(client.pooled_here())
     }
 
     // -- what connections report (any thread) --
@@ -3259,6 +3743,55 @@ mod tests {
             ("INSERT INTO t (id) VALUES (1)", None),
         ] {
             assert_eq!(used_database(sql).as_deref(), want, "{sql:?}");
+        }
+    }
+
+    /// The statements that change the state of a session are read by
+    /// their first words, as the server reads them; anything else, and
+    /// anything that is not exactly one such statement, is left alone.
+    #[test]
+    fn the_statements_that_change_a_session_are_read() {
+        use SessionChange::*;
+        let kept = |text: &str| Some(text.to_string());
+        for (sql, want) in [
+            ("USE app", Some(Use("app".into()))),
+            ("-- first\nuse \"a;b\";", Some(Use("a;b".into()))),
+            ("SET CONSISTENCY ALL", Some(Consistency(kept("SET CONSISTENCY ALL")))),
+            ("  set\tconsistency\n one ; ", Some(Consistency(kept("set\tconsistency\n one")))),
+            ("SET CONSISTENCY QUORUM -- for now", Some(Consistency(kept("SET CONSISTENCY QUORUM")))),
+            ("-- strict\n  -- reads\nSET CONSISTENCY ALL", Some(Consistency(kept("SET CONSISTENCY ALL")))),
+            ("SET CONSISTENCY DEFAULT", Some(Consistency(None))),
+            ("set consistency default;", Some(Consistency(None))),
+            ("SET SCAN BUDGET ROWS 5", Some(ScanBudget(kept("SET SCAN BUDGET ROWS 5")))),
+            ("SET SCAN BUDGET BYTES 4096 ROWS 9;", Some(ScanBudget(kept("SET SCAN BUDGET BYTES 4096 ROWS 9")))),
+            ("Set Scan  Budget Default", Some(ScanBudget(None))),
+            ("SET SCAN BUDGET ROWS 5; SET CONSISTENCY ALL", None),
+            ("SET CONSISTENCY ALL; SELECT 1", None),
+            ("SET CONFIG k = 'v'", None),
+            ("SET SCAN", None),
+            ("SETTLE", None),
+            ("-- SET CONSISTENCY ONE", None),
+            ("BEGIN", Some(Begin)),
+            ("begin;", Some(Begin)),
+            ("BEGIN TRANSACTION", Some(Begin)),
+            ("BEGIN ATOMIC PARTITION (tenant = 't;1') -- pinned", Some(Begin)),
+            ("-- all or nothing\nBEGIN ATOMIC", Some(Begin)),
+            ("BEGINNING", None),
+            ("COMMIT", Some(Commit)),
+            ("commit transaction ;", Some(Commit)),
+            ("COMMIT -- done", Some(Commit)),
+            ("COMMIT WORK", None),
+            ("COMMIT; BEGIN", None),
+            ("ROLLBACK", Some(Rollback)),
+            ("Rollback Transaction;", Some(Rollback)),
+            ("ROLLBACK TO here", None),
+            ("ROLLBACK TRANSACTION now", None),
+            ("SELECT 'BEGIN'", None),
+            ("INSERT INTO t (id) VALUES (1)", None),
+            ("(SELECT 1)", None),
+            ("", None),
+        ] {
+            assert_eq!(session_change(sql), want, "{sql:?}");
         }
     }
 

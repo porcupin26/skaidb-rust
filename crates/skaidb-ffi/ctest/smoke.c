@@ -1,8 +1,9 @@
 /* libskaidb C smoke test: connect, DDL, typed parameters through a prepared
  * statement, a batch, a read-back with every value accessor, a pipeline
  * with an inline error, a streamed result (and an abandoned one), the
- * result sets of a streamed CALL, values on their own, and the pools (plain
- * and balanced). Run by ctest/run.sh. */
+ * result sets of a streamed CALL, values on their own, the pools (plain
+ * and balanced) and the session state they and a reconnect keep. Run by
+ * ctest/run.sh. */
 #include "skaidb.h"
 
 #include <inttypes.h>
@@ -331,6 +332,63 @@ int main(void) {
     ASSERT(skaidb_members_len(none) == 0); /* a plain pool knows no members */
     skaidb_members_free(none);
     skaidb_pool_free(pool);
+
+    /* Session state. A SET sent as a statement is the session's: the
+     * connection that replaces this one is given it back. */
+    CHECK(skaidb_execute(c, "SET SCAN BUDGET ROWS 1", &r));
+    skaidb_result_free(r);
+    ASSERT(skaidb_execute(c, "SELECT id FROM cffi_smoke WHERE score >= 0", &r) == SKAIDB_ERR_SERVER);
+    ASSERT(strstr(skaidb_last_error(), "scan budget") != NULL);
+    CHECK(skaidb_client_reconnect(c));
+    ASSERT(skaidb_execute(c, "SELECT id FROM cffi_smoke WHERE score >= 0", &r) == SKAIDB_ERR_SERVER);
+    ASSERT(strstr(skaidb_last_error(), "scan budget") != NULL);
+    /* The method and the statement are one setting: cleared by either. */
+    CHECK(skaidb_client_set_scan_budget_rows(c, 0));
+    CHECK(skaidb_client_reconnect(c));
+    CHECK(skaidb_execute(c, "SELECT count(*) FROM cffi_smoke", &r));
+    ASSERT(skaidb_value_get_int(skaidb_result_cell(r, 0, 0)) == 4);
+    skaidb_result_free(r);
+
+    /* A pool hands every borrower its own session state: one borrower's
+     * scan budget and open transaction are not the next one's. */
+    pool = skaidb_pool_new(1, eps, 1, user, password, NULL, NULL);
+    ASSERT(pool != NULL);
+    CHECK(skaidb_pool_acquire(pool, &pc));
+    CHECK(skaidb_execute(pc, "SET SCAN BUDGET ROWS 1", &r));
+    skaidb_result_free(r);
+    CHECK(skaidb_execute(pc, "BEGIN", &r));
+    skaidb_result_free(r);
+    CHECK(skaidb_execute(pc, "INSERT INTO cffi_smoke (id) VALUES (99)", &r));
+    skaidb_result_free(r);
+    skaidb_pool_release(pool, pc);
+    ASSERT(skaidb_pool_idle_len(pool) == 1); /* put back, not closed */
+    CHECK(skaidb_pool_acquire(pool, &pc));
+    CHECK(skaidb_execute(pc, "SELECT count(*) FROM cffi_smoke", &r));
+    ASSERT(skaidb_value_get_int(skaidb_result_cell(r, 0, 0)) == 4); /* rolled back */
+    skaidb_result_free(r);
+    /* A consistency override is cleared, or (a server before 0.349) the
+     * connection closed: either way the next borrower has none. */
+    CHECK(skaidb_execute(pc, "SET CONSISTENCY ALL", &r));
+    skaidb_result_free(r);
+    skaidb_pool_release(pool, pc);
+    CHECK(skaidb_pool_acquire(pool, &pc));
+    CHECK(skaidb_execute(pc, "SELECT count(*) FROM cffi_smoke", &r));
+    skaidb_result_free(r);
+    skaidb_pool_release(pool, pc);
+    skaidb_pool_free(pool);
+
+    /* A transaction by hand, with no connection lost, is as it was. */
+    CHECK(skaidb_execute(c, "BEGIN", &r));
+    skaidb_result_free(r);
+    CHECK(skaidb_execute(c, "INSERT INTO cffi_smoke (id) VALUES (98)", &r));
+    skaidb_result_free(r);
+    ASSERT(skaidb_client_reconnect(c) == SKAIDB_ERR_IO); /* refused while it is open */
+    CHECK(skaidb_execute(c, "ROLLBACK", &r));
+    skaidb_result_free(r);
+    CHECK(skaidb_client_reconnect(c));
+    CHECK(skaidb_execute(c, "SELECT count(*) FROM cffi_smoke", &r));
+    ASSERT(skaidb_value_get_int(skaidb_result_cell(r, 0, 0)) == 4);
+    skaidb_result_free(r);
 
     /* The balanced pool, against one standalone server: SHOW ENDPOINTS
      * answers no rows there, so discovery keeps the seed and stops. */

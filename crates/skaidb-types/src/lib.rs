@@ -36,7 +36,7 @@ mod value;
 pub use slog::{init_server_log, log_timestamp, log_timestamp_into, push_u64, server_log};
 pub use ternary::Ternary;
 pub use value::{
-    cmp_decimal, cmp_decimal_f64, cmp_i64_decimal, cmp_i64_f64, decode_numeric_key, decode_scalar_key_tuple, encoded_array_prefix, i64_is_exact_f64, key_tag,
-    order_cmp, Decimal,
+    cmp_decimal, cmp_decimal_f64, cmp_i64_decimal, cmp_i64_f64, decode_numeric_key, decode_scalar_key_tuple, encoded_array_prefix, i64_is_exact_f64, key_prefix_positions,
+    key_tag, key_type_bit, note_key_types, order_cmp, Decimal, KEY_POSITIONS, KEY_TYPES_ANY,
     Document, Uuid, Value, ValueError, ValueType,
 };
